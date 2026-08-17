@@ -9,7 +9,7 @@ from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from config import IMAGE_DIR, IMPORT_DIR, OCR_FALLBACK, IMPORT_ADMINS_ONLY, IMAGE_CHECK_TIMEOUT, MAX_CONCURRENT_IMAGE_CHECKS
+from config import IMAGE_DIR, IMPORT_DIR, OCR_FALLBACK, IMPORT_ADMINS_ONLY, IMAGE_CHECK_TIMEOUT, MAX_CONCURRENT_IMAGE_CHECKS, AUTO_COLLISION_THRESHOLD
 from core.customer import parse_customer_info, is_customer_record, public_customer_data
 from core.database import get_conn, save_pending_buffer, delete_pending_buffer, load_pending_buffers, cleanup_expired_pending_buffers
 from core.object_storage import upload_image, image_object_key
@@ -144,7 +144,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(text, parse_mode="Markdown")
         return
 
-    # 相似图片：创建待确认记录
+    # 相似图片：90% 及以上直接自动确认为撞客；低于 90% 才需要人工确认。
     if result["type"] == "similar":
         matched = await _run_sync(_get_matched_customer, result["matched_image_id"])
         collision_id = await _run_sync(
@@ -157,6 +157,32 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result["match_type"],
             result["score"],
         )
+
+        score = float(result.get("score") or 0.0)
+        if score >= AUTO_COLLISION_THRESHOLD:
+            # 直接把碰撞记录从 pending 变更为 confirmed，避免统计里仍显示“待确认”。
+            await _run_sync(
+                confirm_collision,
+                collision_id,
+                "confirmed",
+                "系统自动确认",
+                "system",
+            )
+            text = (
+                f"🔴 *撞客*\n\n"
+                f"匹配类型：{result['match_type']}\n"
+                f"相似度：{score:.2f}%"
+            )
+            if matched and matched.get("name"):
+                text += f"\n已有客户：*{matched['name']}*"
+                extra = _format_customer_summary(matched)
+                if extra:
+                    text += f"\n{extra}"
+            text += f"\n\n✅ 已自动确认撞客（≥{AUTO_COLLISION_THRESHOLD:.0f}%）"
+            await msg.reply_text(text, parse_mode="Markdown")
+            return
+
+        # 低于自动确认阈值的相似图片保留人工确认按钮。
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ 确认撞客", callback_data=f"collision:confirmed:{collision_id}"),
             InlineKeyboardButton("❌ 误判", callback_data=f"collision:false_positive:{collision_id}"),
@@ -164,7 +190,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"🟠 *疑似撞客*\n\n"
             f"匹配类型：{result['match_type']}\n"
-            f"相似度：{result['score']:.2f}%"
+            f"相似度：{score:.2f}%"
         )
         if matched and matched.get("name"):
             text += f"\n已有客户：*{matched['name']}*"

@@ -1,4 +1,4 @@
-# TG Anti-Collision Bot V1.7
+# TG Anti-Collision Bot V1.7.1
 
 GitHub + Railway deployment package.
 

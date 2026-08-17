@@ -107,7 +107,7 @@ def start():
     app.add_handler(CallbackQueryHandler(collision_callback, pattern=r"^collision:"))
 
     app.add_error_handler(_error)
-    print("TG防撞客机器人 V1.7 ONE-PHOTO-ONE-CUSTOMER GitHub + Railway 启动（群聊专用 / 私聊关闭）")
+    print("TG防撞客机器人 V1.7.1 AUTO90 ONE-PHOTO-ONE-CUSTOMER GitHub + Railway 启动（群聊专用 / 私聊关闭）")
     app.run_polling(
         drop_pending_updates=False,
         allowed_updates=["message", "callback_query"],

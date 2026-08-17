@@ -1,4 +1,4 @@
-TG Anti-Collision Bot V1.7 - GitHub + Railway
+TG Anti-Collision Bot V1.7.1 - GitHub + Railway
 
 1. Upload ALL files and folders from this package to the ROOT of a GitHub repository.
    Do not upload this ZIP itself as the only repository file.
@@ -21,9 +21,9 @@ TG Anti-Collision Bot V1.7 - GitHub + Railway
 
 7. History import:
    - Group administrators can send supported ZIP/JSON/HTML files to the group.
-   - V1.7 compact bundles contain history_manifest.json + photos/.
+   - V1.7.1 compact bundles contain history_manifest.json + photos/.
    - One imported photo creates one customer even if no customer profile text exists.
    - Exact duplicate photos are skipped as duplicates.
 
 Expected startup log:
-TG防撞客机器人 V1.7 ONE-PHOTO-ONE-CUSTOMER GitHub + Railway 启动（群聊专用 / 私聊关闭）
+TG防撞客机器人 V1.7.1 ONE-PHOTO-ONE-CUSTOMER GitHub + Railway 启动（群聊专用 / 私聊关闭）
