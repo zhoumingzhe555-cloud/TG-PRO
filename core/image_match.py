@@ -739,14 +739,15 @@ def save_image_alias(path,matched_image_id,file_id="",file_unique_id="",submitte
     finally: conn.close()
 
 
-def create_collision(query_sha256,matched_image_id,submitter,submitter_id,chat_id,match_type,score,query_phash="",query_file_path="",query_file_id="",query_file_unique_id="",query_copy_feature=None):
+def create_collision(query_sha256,matched_image_id,submitter,submitter_id,chat_id,match_type,score,query_phash="",query_file_path="",query_file_id="",query_file_unique_id="",query_copy_feature=None,query_customer_data=None,query_raw_text="",query_source_message_id=""):
     blob,dim=pack_copy_feature(query_copy_feature)
+    customer_json=json.dumps(query_customer_data,ensure_ascii=False) if query_customer_data else None
     conn=get_conn()
     try:
         cur=conn.execute(
-            """INSERT INTO collision_records(query_sha256,query_phash,query_file_path,query_file_id,query_file_unique_id,query_copy_feature,query_copy_dim,matched_image_id,query_submitter,query_submitter_id,chat_id,match_type,score,status,created_time)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)""",
-            (query_sha256,query_phash,query_file_path,query_file_id,query_file_unique_id,blob,dim,matched_image_id,submitter,submitter_id,chat_id,match_type,float(score),now_iso()),
+            """INSERT INTO collision_records(query_sha256,query_phash,query_file_path,query_file_id,query_file_unique_id,query_copy_feature,query_copy_dim,query_customer_json,query_raw_text,query_source_message_id,matched_image_id,query_submitter,query_submitter_id,chat_id,match_type,score,status,created_time)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending',?)""",
+            (query_sha256,query_phash,query_file_path,query_file_id,query_file_unique_id,blob,dim,customer_json,query_raw_text or "",str(query_source_message_id or ""),matched_image_id,submitter,submitter_id,chat_id,match_type,float(score),now_iso()),
         )
         cid=cur.lastrowid
         conn.commit()

@@ -1,4 +1,4 @@
-# V1.9.5 REVIEW-FIX + CAPTION-ENTRY
+# V1.9.6 EDITED-CAPTION-ENTRY + REVIEW-FIX + MATCH-PREVIEW
 
 ## 实时客户入库规则
 
@@ -98,3 +98,8 @@ Telegram 图片 caption/备注中包含正式客户资料时，图片与资料�
 - 新客户正式入库时同步生成并保存 SSCD AI 特征，可立即参与下一张图片查撞。
 - 旧图库补SSCD时使用完整多区域视图。
 - 待人工审核图片在按钮处理前不会被孤立文件清理任务删除。
+
+## V1.9.6 图片备注自动入库
+- 支持图片发送后再编辑 caption 补客户资料（edited_message）。
+- 图+资料一旦完整且不是撞客，自动正式入库。
+- 疑似撞客若人工点“误判”，图片中已有的客户资料会自动入库。

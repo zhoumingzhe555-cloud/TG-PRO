@@ -198,16 +198,19 @@ def start():
     # /edit、/cancel 以及私聊文字编辑流程已取消。
 
     # ── 仅群聊消息 ──────────────────────────────────────────────────────────
-    app.add_handler(MessageHandler(GROUPS_ONLY & filters.PHOTO, photo_handler))
-    app.add_handler(MessageHandler(GROUPS_ONLY & filters.Document.ALL, document_handler))
-    app.add_handler(MessageHandler(GROUPS_ONLY & filters.TEXT & ~filters.COMMAND, text_handler))
+    # 同时处理普通 message 与 edited_message。图片备注经常是先发图后再点“编辑”补客户资料；
+    # 如果不订阅 edited_message，Telegram 根本不会把后补 caption 交给机器人。
+    GROUP_MESSAGE_UPDATES = GROUPS_ONLY & filters.UpdateType.MESSAGES
+    app.add_handler(MessageHandler(GROUP_MESSAGE_UPDATES & filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(GROUP_MESSAGE_UPDATES & filters.Document.ALL, document_handler))
+    app.add_handler(MessageHandler(GROUP_MESSAGE_UPDATES & filters.TEXT & ~filters.COMMAND, text_handler))
 
     # 撞客人工确认按钮保留；handler 内部再次校验必须来自群聊。
     app.add_handler(CallbackQueryHandler(collision_callback, pattern=r"^collision:"))
 
     app.add_error_handler(_error)
-    print("TG防撞客机器人 V1.9.5 REVIEW-FIX CAPTION-ENTRY MATCH-PREVIEW SAFE-MATCH SSCD-AI COPY-GUARD AUTO90 GitHub + Railway 启动（群聊专用 / 私聊关闭）")
+    print("TG防撞客机器人 V1.9.6 EDITED-CAPTION-ENTRY REVIEW-FIX MATCH-PREVIEW SAFE-MATCH SSCD-AI COPY-GUARD AUTO90 GitHub + Railway 启动（群聊专用 / 私聊关闭）")
     app.run_polling(
         drop_pending_updates=False,
-        allowed_updates=["message", "callback_query"],
+        allowed_updates=["message", "edited_message", "callback_query"],
     )

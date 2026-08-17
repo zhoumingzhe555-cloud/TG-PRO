@@ -95,7 +95,15 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tgfile = await context.bot.get_file(photo.file_id)
     await tgfile.download_to_drive(path)
 
-    log.info("[photo] 下载完成 chat_type=%s file=%s", chat.type, photo.file_id)
+    log.info("[photo] 下载完成 chat_type=%s file=%s edited=%s", chat.type, photo.file_id, bool(update.edited_message))
+
+    # V1.9.6：图片备注（caption）在任何检测分支前先解析。
+    # 这样即使图片后来进入“疑似撞客→人工误判”流程，客户资料也不会丢。
+    caption_raw = (msg.caption or "").strip()
+    caption_info = parse_customer_info(caption_raw)
+    caption_is_customer = is_customer_record(caption_info)
+    if caption_is_customer:
+        log.info("[entry] 识别到图片备注客户资料 message_id=%s edited=%s", msg.message_id, bool(update.edited_message))
 
     # ——— 图片检测（CPU密集，放入线程池）———
     try:
@@ -118,6 +126,28 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 同一图片：私聊→显示摘要+覆盖按钮；群聊→报撞
     if result["type"] == "same":
         matched = await _run_sync(_get_matched_customer, result["matched_image_id"])
+
+        # 如果这是“已入库的原消息”后来编辑图片备注，只更新该客户资料，
+        # 不把自己的原图再次报成撞客。Telegram 只有消息作者能编辑原消息，
+        # 再结合 chat_id + source_message_id 双重校验，避免覆盖其他客户。
+        if (
+            caption_is_customer
+            and bool(update.edited_message)
+            and matched
+            and str(matched.get("chat_id") or "") == str(chat.id)
+            and str(matched.get("source_message_id") or "") == str(msg.message_id)
+        ):
+            fields = {k: v for k, v in public_customer_data(caption_info).items() if str(v or "").strip()}
+            try:
+                updated = await _run_sync(
+                    update_customer_fields, matched["id"], fields, str(user.id), _user_name(user), str(user.id)
+                )
+                if updated:
+                    await msg.reply_text("✅ 图片备注客户资料已更新")
+                    return
+            except Exception:
+                log.warning("编辑图片备注更新已有客户资料失败，继续按撞客处理", exc_info=True)
+
         if chat.type == "private":
             # 私聊：提示已有客户资料，并在有新说明文字时提供覆盖选项
             customer_id = matched["id"] if matched else None
@@ -175,6 +205,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photo.file_id,
             photo.file_unique_id or "",
             next((x.get("feature") for x in (result.get("features",{}).get("copy_views") or []) if x.get("feature") is not None), None),
+            public_customer_data(caption_info) if caption_is_customer else None,
+            caption_raw if caption_is_customer else "",
+            str(msg.message_id),
         )
 
         score = float(result.get("score") or 0.0)
@@ -237,10 +270,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 图片“备注/说明文字”在 Telegram Bot API 中就是 caption。
     # caption 是正式入库资料的最高优先级：图 + 可识别客户资料 = 直接进入正式入库流程。
     # 同时支持多行备注，以及“姓名：... 年龄：... 职业：...”这种单行备注。
-    raw_text = (msg.caption or "").strip()
-    info = parse_customer_info(raw_text)
-    if is_customer_record(info):
-        log.info("[entry] 图片 caption/备注识别到正式客户资料 message_id=%s", msg.message_id)
+    raw_text = caption_raw
+    info = caption_info
+    if caption_is_customer:
+        log.info("[entry] 图片 caption/备注进入正式入库流程 message_id=%s edited=%s", msg.message_id, bool(update.edited_message))
 
     import time
     key = (str(chat.id), str(user.id))
@@ -314,6 +347,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raw_text,
             features=result.get("features"),
         )
+        if saved:
+            # 如果这张图先以“纯图片查询”出现，后来用户编辑 caption 补资料，
+            # 旧图片缓冲必须同步清掉，否则后续一条资料消息可能再次错误绑定这张图。
+            await _clear_pending_image_for_message(str(chat.id), str(msg.message_id), context)
         if consumed_text_entry is not None:
             if saved:
                 try:
@@ -374,6 +411,28 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         log.warning("保存图片缓冲到DB失败", exc_info=True)
+
+
+async def _clear_pending_image_for_message(chat_id: str, message_id: str, context) -> None:
+    """Clear a previously buffered query image after caption/text turns it into a formal customer."""
+    entry = _pending_by_chat_message.pop((str(chat_id), str(message_id)), None)
+    if not entry:
+        return
+    owner_user_id = str(entry.get("owner_user_id") or "")
+    if owner_user_id:
+        owner_key = (str(chat_id), owner_user_id)
+        if _pending.get(owner_key) is entry:
+            _pending.pop(owner_key, None)
+    for k, v in list(_pending_by_message.items()):
+        if v is entry:
+            _pending_by_message.pop(k, None)
+    if context.job_queue is not None and owner_user_id:
+        for job in context.job_queue.get_jobs_by_name(f"pending_expire_{chat_id}_{owner_user_id}"):
+            job.schedule_removal()
+    try:
+        await _run_sync(delete_pending_buffer, "image", str(chat_id), owner_user_id, message_id)
+    except Exception:
+        log.warning("清理已正式入库图片的旧缓冲失败", exc_info=True)
 
 
 async def _do_expire_pending(chat_id, user_id: str, gen: float, bot) -> None:
@@ -678,9 +737,43 @@ async def collision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except Exception:
                 log.warning("保存人工确认图片别名失败（不影响确认结果）", exc_info=True)
 
+        # 图片本身带正式客户备注但被算法判为“疑似”时，人工点击【误判】
+        # 就等于确认它不是撞客；此时应自动把“图片+资料”正式入库，而不是让资料丢失。
+        review_inserted = False
+        if status == "false_positive" and collision and collision.get("query_customer_json"):
+            try:
+                import json as _json
+                qp = collision.get("query_file_path")
+                cdata = _json.loads(collision.get("query_customer_json") or "{}")
+                if qp and Path(qp).exists() and str(cdata.get("name") or "").strip():
+                    obj_key = image_object_key(collision.get("query_file_unique_id") or collision.get("query_file_id") or f"review_{cid}")
+                    try:
+                        await _run_sync(upload_image, Path(qp), obj_key)
+                    except Exception:
+                        obj_key = None
+                    _, _, review_inserted = await _run_sync(
+                        save_customer_and_image,
+                        Path(qp),
+                        collision.get("query_file_id") or "",
+                        collision.get("query_file_unique_id") or "",
+                        collision.get("query_submitter") or _user_name(user),
+                        collision.get("query_submitter_id") or str(user.id),
+                        collision.get("chat_id") or str(chat.id),
+                        cdata,
+                        collision.get("query_raw_text") or "",
+                        "review_false_positive",
+                        collision.get("query_source_message_id") or "",
+                        obj_key,
+                        None,
+                    )
+            except Exception:
+                log.exception("误判后自动入库图片备注客户资料失败")
+
         label = "✅ 已确认撞客" if status == "confirmed" else "✅ 已标记为误判"
         if status == "false_positive":
             label += "（该图片组合以后将被排除）"
+            if review_inserted:
+                label += "\n✅ 图片备注客户资料已自动入库"
         message = q.message
         base = ((getattr(message, "caption", None) or getattr(message, "text", None) or "").rstrip())
         suffix = f"\n\n{label}\n确认人：{_user_name(user)}"

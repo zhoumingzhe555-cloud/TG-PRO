@@ -181,6 +181,7 @@ def init_db() -> None:
         _ensure_columns(conn, "collision_records", {
             "query_phash":"TEXT", "query_file_path":"TEXT", "query_file_id":"TEXT", "query_file_unique_id":"TEXT",
             "query_copy_feature":"BLOB", "query_copy_dim":"INTEGER DEFAULT 0",
+            "query_customer_json":"TEXT", "query_raw_text":"TEXT", "query_source_message_id":"TEXT",
         })
 
         conn.execute("""

@@ -1,0 +1,23 @@
+V1.9.6 EDITED-CAPTION-ENTRY 测试报告
+
+修复原因：
+- Telegram 图片备注后显示“已编辑”时，属于 edited_message 更新。
+- 旧版本 run_polling 只订阅 message/callback_query，因此图片发送后再编辑备注，机器人收不到后补资料。
+
+已检查：
+1. python -m compileall：通过。
+2. cille 示例备注解析：通过。
+   姓名：cille
+   年龄：38歲
+   职业：游泳教练
+   收入：
+   工作年限：
+   引流软件：小软件+13
+   接粉人员：自引
+3. collision_records 数据库自动迁移：新增 query_customer_json/query_raw_text/query_source_message_id，测试通过。
+4. create_collision 保存备注客户资料：测试通过。
+5. edited_message 已加入 allowed_updates。
+6. MessageHandler 使用 filters.UpdateType.MESSAGES，可同时处理 message + edited_message。
+7. 图片先纯图查询、后编辑备注正式入库后，会清除旧 pending 图片缓冲。
+8. 图片备注进入“疑似撞客”时，备注资料保存在 collision_records；人工点“误判”后自动正式入库。
+9. 已入库原消息再次编辑备注：按 chat_id + source_message_id 校验后更新自己的客户资料，不会当成新的撞客记录。
