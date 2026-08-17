@@ -640,6 +640,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def collision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle human review buttons on either text messages or photo/document captions.
+
+    V1.9.2 put the buttons on the historical preview image, so using
+    edit_message_text() always failed for media messages. V1.9.5 edits the caption
+    when the callback belongs to a photo/document and gives an immediate visible
+    acknowledgement.
+    """
     q = update.callback_query
     if not q:
         return
@@ -647,15 +654,18 @@ async def collision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not chat or chat.type not in {"group", "supergroup"}:
         await q.answer("私聊模式已关闭", show_alert=True)
         return
-    await q.answer()
     try:
         _, status, cid = q.data.split(":", 2)
         user = update.effective_user
         collision = await _run_sync(get_collision, int(cid))
+        if not collision:
+            await q.answer("记录不存在或已清理", show_alert=True)
+            return
         ok = await _run_sync(confirm_collision, int(cid), status, _user_name(user), str(user.id))
         if not ok:
-            await q.answer("该记录已被处理", show_alert=True)
+            await q.answer("该记录已被其他人处理", show_alert=True)
             return
+
         if status == "confirmed" and collision:
             try:
                 qp = collision.get("query_file_path")
@@ -667,15 +677,33 @@ async def collision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     )
             except Exception:
                 log.warning("保存人工确认图片别名失败（不影响确认结果）", exc_info=True)
+
         label = "✅ 已确认撞客" if status == "confirmed" else "✅ 已标记为误判"
-        base = q.message.text or ""
-        await q.edit_message_text(
-            base + f"\n\n{label}\n确认人：{_user_name(user)}",
-            parse_mode="Markdown",
-        )
+        if status == "false_positive":
+            label += "（该图片组合以后将被排除）"
+        message = q.message
+        base = ((getattr(message, "caption", None) or getattr(message, "text", None) or "").rstrip())
+        suffix = f"\n\n{label}\n确认人：{_user_name(user)}"
+        updated = (base + suffix).strip()
+
+        # Telegram media messages must be edited through caption, not text.
+        try:
+            if message and (message.photo or message.document or message.video or message.animation):
+                await q.edit_message_caption(caption=updated[:1024], reply_markup=None)
+            else:
+                await q.edit_message_text(updated[:4096], reply_markup=None)
+        except Exception:
+            log.warning("更新审核消息失败，改用新消息确认", exc_info=True)
+            if message:
+                await message.reply_text(suffix.strip())
+
+        await q.answer("已确认撞客" if status == "confirmed" else "已记录误判")
     except Exception:
         log.exception("撞客确认失败")
-        await q.answer("操作失败", show_alert=True)
+        try:
+            await q.answer("操作失败，请稍后再试", show_alert=True)
+        except Exception:
+            pass
 
 async def override_customer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理私聊重复图片的「覆盖资料」/ 「取消」回调。"""

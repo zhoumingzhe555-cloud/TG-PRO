@@ -1,3 +1,1 @@
-V1.9.4 CAPTION-ENTRY
-GitHub + Railway / 群聊专用 / 私聊关闭
-规则：图片备注(caption)中的客户资料，与图片同发时直接正式入库；同时支持图文分开发、回复绑定。
+V1.9.5 REVIEW-FIX

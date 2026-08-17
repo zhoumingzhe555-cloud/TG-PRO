@@ -23,7 +23,7 @@ for _p in (DATA_DIR, IMAGE_DIR, MODEL_DIR, IMPORT_DIR):
 # ── Matching policy ───────────────────────────────────────────────────────────
 # Scores >= 90 are reserved for strong same-photo evidence. Weak semantic/colour
 # similarity is capped below this threshold so AUTO90 remains safe.
-SIMILAR_THRESHOLD = float(os.getenv("SIMILAR_THRESHOLD", "84"))
+SIMILAR_THRESHOLD = float(os.getenv("SIMILAR_THRESHOLD", "85"))
 AUTO_COLLISION_THRESHOLD = float(os.getenv("AUTO_COLLISION_THRESHOLD", "90"))
 PHASH_DIRECT_THRESHOLD = float(os.getenv("PHASH_DIRECT_THRESHOLD", "96"))
 

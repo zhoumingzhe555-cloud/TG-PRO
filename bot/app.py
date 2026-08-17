@@ -11,7 +11,7 @@ from bot.recover import recover_images_command
 from ai.embedding import preload
 from ai.copy_embedding import preload as preload_copy_ai
 from core.database import cleanup_expired_pending_buffers
-from core.image_match import reindex_missing_signatures, reindex_missing_copy_features, count_copy_index_status, cleanup_orphan_image_files
+from core.image_match import reindex_missing_signatures, reindex_missing_copy_features, count_copy_index_status, count_signature_index_status, cleanup_orphan_image_files
 
 log = logging.getLogger(__name__)
 
@@ -42,23 +42,42 @@ async def _periodic_cleanup_pending_buffers(context) -> None:
 
 
 async def _periodic_reindex(context) -> None:
-    """Background migration: enrich old V1.7 images with V1.8 multi-view signatures."""
+    """Backfill old multi-view hashes, then remove this repeating job at 100%."""
     try:
         loop = asyncio.get_running_loop()
+        total,indexed,missing = await loop.run_in_executor(None, count_signature_index_status)
+        if missing <= 0:
+            if getattr(context, "job", None):
+                context.job.schedule_removal()
+            log.info("多尺度Hash旧图库索引已完成 %d/%d，后台任务停止", indexed, total)
+            return
         done = await loop.run_in_executor(None, reindex_missing_signatures, REINDEX_BATCH_SIZE)
+        total,indexed,missing = await loop.run_in_executor(None, count_signature_index_status)
         if done:
-            log.info("多尺度Hash索引后台升级：本轮完成 %d 张", done)
+            log.info("多尺度Hash索引后台升级：本轮 %d 张；已完成 %d/%d，剩余 %d", done, indexed, total, missing)
+        if missing <= 0 and getattr(context, "job", None):
+            context.job.schedule_removal()
+            log.info("多尺度Hash旧图库索引100%%完成，后台任务已停止")
     except Exception:
         log.warning("多尺度Hash索引后台升级失败（不影响实时检测）", exc_info=True)
 
 async def _periodic_copy_reindex(context) -> None:
-    """Gradually add SSCD descriptors to V1.8/V1.7 historical images."""
+    """Backfill SSCD only while missing rows exist; stop permanently at 100%."""
     try:
         loop=asyncio.get_running_loop()
+        total,indexed,missing=await loop.run_in_executor(None,count_copy_index_status)
+        if missing <= 0:
+            if getattr(context, "job", None):
+                context.job.schedule_removal()
+            log.info("V1.9 SSCD AI旧图库索引已完成 %d/%d，后台任务停止",indexed,total)
+            return
         done=await loop.run_in_executor(None,reindex_missing_copy_features,COPY_REINDEX_BATCH_SIZE)
+        total,indexed,missing=await loop.run_in_executor(None,count_copy_index_status)
         if done:
-            total,indexed,missing=await loop.run_in_executor(None,count_copy_index_status)
             log.info("V1.9 SSCD AI索引升级：本轮 %d 张；已完成 %d/%d，剩余 %d",done,indexed,total,missing)
+        if missing <= 0 and getattr(context, "job", None):
+            context.job.schedule_removal()
+            log.info("V1.9 SSCD AI旧图库索引100%%完成，后台任务已停止；新客户入库时即时生成SSCD特征")
     except Exception:
         log.warning("V1.9 SSCD AI索引升级失败（经典视觉仍可用）",exc_info=True)
 
@@ -119,24 +138,26 @@ async def _post_init(app):
         log.warning("注册定期清理任务失败（不影响机器人运行）", exc_info=True)
 
     try:
-        app.job_queue.run_repeating(
-            _periodic_reindex,
-            interval=REINDEX_INTERVAL_SEC,
-            first=8,
-            name="v18_reindex_signatures",
-        )
-        log.info("已注册 多尺度Hash旧图库后台索引升级任务：每 %d 秒最多 %d 张", REINDEX_INTERVAL_SEC, REINDEX_BATCH_SIZE)
+        total,indexed,missing=await loop.run_in_executor(None,count_signature_index_status)
+        if missing > 0:
+            app.job_queue.run_repeating(
+                _periodic_reindex, interval=REINDEX_INTERVAL_SEC, first=8, name="v18_reindex_signatures",
+            )
+            log.info("多尺度Hash待补 %d 张：已启动后台任务，每 %d 秒最多 %d 张", missing, REINDEX_INTERVAL_SEC, REINDEX_BATCH_SIZE)
+        else:
+            log.info("多尺度Hash索引已完成 %d/%d：不启动后台任务", indexed, total)
     except Exception:
         log.warning("注册 多尺度Hash索引升级任务失败（不影响实时检测）", exc_info=True)
 
     try:
-        app.job_queue.run_repeating(
-            _periodic_copy_reindex,
-            interval=COPY_REINDEX_INTERVAL_SEC,
-            first=12,
-            name="v19_reindex_sscd_copy_ai",
-        )
-        log.info("已注册 V1.9 SSCD AI旧图库升级任务：每 %d 秒最多 %d 张",COPY_REINDEX_INTERVAL_SEC,COPY_REINDEX_BATCH_SIZE)
+        total,indexed,missing=await loop.run_in_executor(None,count_copy_index_status)
+        if missing > 0:
+            app.job_queue.run_repeating(
+                _periodic_copy_reindex, interval=COPY_REINDEX_INTERVAL_SEC, first=12, name="v19_reindex_sscd_copy_ai",
+            )
+            log.info("SSCD AI待补 %d 张：已启动后台任务，每 %d 秒最多 %d 张；补完自动停止",missing,COPY_REINDEX_INTERVAL_SEC,COPY_REINDEX_BATCH_SIZE)
+        else:
+            log.info("SSCD AI索引已完成 %d/%d：不启动后台任务；新客户入库即时生成特征",indexed,total)
     except Exception:
         log.warning("注册 V1.9 SSCD AI索引升级任务失败（不影响实时检测）",exc_info=True)
 
@@ -185,7 +206,7 @@ def start():
     app.add_handler(CallbackQueryHandler(collision_callback, pattern=r"^collision:"))
 
     app.add_error_handler(_error)
-    print("TG防撞客机器人 V1.9.3 ENTRY-PAIR MATCH-PREVIEW SAFE-MATCH SSCD-AI COPY-GUARD AUTO90 GitHub + Railway 启动（群聊专用 / 私聊关闭）")
+    print("TG防撞客机器人 V1.9.5 REVIEW-FIX CAPTION-ENTRY MATCH-PREVIEW SAFE-MATCH SSCD-AI COPY-GUARD AUTO90 GitHub + Railway 启动（群聊专用 / 私聊关闭）")
     app.run_polling(
         drop_pending_updates=False,
         allowed_updates=["message", "callback_query"],

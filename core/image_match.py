@@ -11,7 +11,7 @@ import numpy as np
 from config import (
     SIMILAR_THRESHOLD, AUTO_COLLISION_THRESHOLD, PHASH_DIRECT_THRESHOLD,
     FAST_CANDIDATE_LIMIT, DEEP_CANDIDATE_LIMIT, GEOMETRY_CANDIDATE_LIMIT,
-    FULL_LIGHT_SCAN_LIMIT, IMAGE_DIR, SSCD_TOP_K,
+    FULL_LIGHT_SCAN_LIMIT, IMAGE_DIR, SSCD_TOP_K, SSCD_MAX_VIEWS,
 )
 from core.database import get_conn, now_iso
 from core.image_features import (
@@ -524,11 +524,21 @@ def check_image(path):
                 item["geometry"]>=90 and item["inliers"]>=16 and item["geom_ratio"]>=0.50
                 and item.get("homography_sane") and cov_min>=0.025 and cov_max>=0.10
             )
+            # Exception for extremely strong wide-area geometric agreement. This
+            # preserves heavy-crop/mirror recognition even if SSCD is temporarily
+            # unavailable, while requiring far more than a repetitive-background
+            # match: many mutual inliers, broad coverage, high ratio and aligned
+            # structure similarity.
+            ultra_geometry=bool(
+                item["geometry"]>=96 and item["inliers"]>=24 and item["geom_ratio"]>=0.60
+                and item.get("homography_sane") and cov_min>=0.055 and cov_max>=0.18
+                and item["ssim"]>=62 and item["overlap"]>=0.10
+            )
             # Geometry alone is not enough for AUTO90. It must agree with at least
             # one independent copy/structure signal; this prevents repetitive
             # backgrounds from becoming 99% false collisions.
             strong_geometry=bool(geom_structural and (
-                item["copy_ai"]>=68 or item["p"]>=88 or item["roi"]>=88 or item["ssim"]>=35
+                item["copy_ai"]>=68 or item["p"]>=88 or item["roi"]>=88
             ))
             # Hashes are recall signals. Auto-confirm from hashes requires SSCD or
             # strong local structure as corroboration.
@@ -542,15 +552,15 @@ def check_image(path):
                 item["geometry"]>=72 or item["p"]>=84 or item["roi"]>=84 or item["orb"]>=66
             ))
             very_strong_copy=bool(not low_info and item["copy_ai"]>=94 and (
-                item["p"]>=78 or item["roi"]>=78 or item["orb"]>=55 or item["geometry"]>=60 or item["hist"]>=90
+                item["p"]>=78 or item["roi"]>=78 or item["orb"]>=55 or item["geometry"]>=60
             ))
             # Simple/flat images may legitimately be the same copy, but hashes alone
             # are unsafe. Require colour agreement + SSCD as additional evidence.
             low_info_safe=bool(low_info and item["p"]>=99 and item["d"]>=97 and item["hist"]>=98 and item["copy_ai"]>=94 and item["geometry"]>=70)
-            strong=bool(strong_geometry or strong_hash or strong_combo or strong_copy or very_strong_copy or low_info_safe)
+            strong=bool(ultra_geometry or strong_geometry or strong_hash or strong_combo or strong_copy or very_strong_copy or low_info_safe)
 
             score=max(item["base"],item["geometry"])
-            if strong_geometry:
+            if ultra_geometry or strong_geometry:
                 score=max(score,item["geometry"])
             if strong_hash:
                 score=max(score,90+(item["p"]-PHASH_DIRECT_THRESHOLD)*1.5)
@@ -564,22 +574,51 @@ def check_image(path):
             if low_info_safe:
                 score=max(score,92+min(5.0,(item["hist"]-97)*0.6+(item["copy_ai"]-90)*0.25))
 
-            if low_info and not (strong_geometry or low_info_safe):
+            if low_info and not (ultra_geometry or strong_geometry or low_info_safe):
                 # Flat/simple/default-avatar images require manual confirmation unless
                 # exact file hash or real local geometry proves they are the same copy.
                 strong=False
+
+            # V1.9.5 REVIEW-SAFE: a score in the 85~89.99 range is shown to humans
+            # only when at least two independent same-copy signals agree. Repetitive
+            # backgrounds (foliage, fences, wood slats, UI text rows) can produce an
+            # apparently decent Homography on their own; that is not enough even for
+            # a suspect alert. This cuts nuisance false positives while preserving
+            # real crop/screenshot cases where SSCD + geometry/hash agree.
+            geom_mid = bool(
+                item["geometry"] >= 84 and item["inliers"] >= 9 and item["geom_ratio"] >= 0.40
+                and item.get("homography_sane") and cov_min >= 0.015 and cov_max >= 0.065
+            )
+            # Count *independent families*, not multiple metrics derived from the
+            # same Homography. Geometry + SSIM alone is one local-structure family
+            # and cannot create a suspect alert by itself.
+            copy_signal = bool(item["copy_ai"] >= 80)
+            hash_signal = bool(max(item["p"], item["roi"]) >= 88 and item["d"] >= 76)
+            local_signal = bool(geom_mid or item["orb"] >= 72)
+            appearance_signal = bool(item["ssim"] >= 46 and item["overlap"] >= 0.10 and item["hist"] >= 68)
+            evidence_count = sum([copy_signal, hash_signal, local_signal, appearance_signal])
+            suspect_evidence = bool(
+                strong
+                or (not low_info and copy_signal and (hash_signal or local_signal or appearance_signal))
+                or (not low_info and local_signal and hash_signal)
+                or (not low_info and item["copy_ai"] >= 90 and (item["p"] >= 76 or item["roi"] >= 76 or geom_mid))
+            )
+
             if not strong:
                 score=min(score,AUTO_COLLISION_THRESHOLD-0.25)
+            if not suspect_evidence:
+                score=min(score,SIMILAR_THRESHOLD-0.25)
             score=min(99.6,max(0.0,score))
 
             # Alias learning is stricter than auto-collision. This prevents one bad
             # auto verdict from contaminating the customer's image cluster.
             learn_safe=bool(
-                (strong_geometry and item["copy_ai"]>=72 and (item["ssim"]>=30 or item["p"]>=90))
+                (ultra_geometry and item["ssim"]>=70)
+                or (strong_geometry and item["copy_ai"]>=72 and (item["ssim"]>=30 or item["p"]>=90))
                 or (not low_info and item["copy_ai"]>=90 and item["geometry"]>=82 and item["inliers"]>=12)
                 or (strong_hash and item["copy_ai"]>=80)
             )
-            cur={**item,"score":score,"strong":strong,"learn_safe":learn_safe,"independent":independent}
+            cur={**item,"score":score,"strong":strong,"learn_safe":learn_safe,"independent":independent,"suspect_evidence":suspect_evidence,"evidence_count":evidence_count}
             if best is None or cur["score"]>best["score"]:
                 best=cur
 
@@ -617,10 +656,23 @@ def _insert_image(conn, customer_id, path, file_id, file_unique_id, submitter, s
     q="""INSERT INTO images(file_id,file_unique_id,file_path,sha256,md5,phash,dhash,roi_phash,p0,p1,p2,p3,p4,p5,p6,p7,color_hist,orb_desc,orb_rows,ai_feature,ai_hash,a0,a1,a2,a3,a4,a5,a6,a7,customer_id,submitter,submitter_id,chat_id,source,created_time) VALUES("""+",".join(["?"]*35)+")"
     cur=conn.execute(q,vals); image_id=cur.lastrowid
     _save_signatures(conn,image_id,f.get("signatures"))
+    # New formal customers are indexed immediately. Normally check_image already
+    # produced copy_views; this fallback covers alternate entry paths so a newly
+    # saved customer is searchable by SSCD before the insert transaction finishes.
+    copy_views=f.get("copy_views") or []
+    if not copy_views:
+        try:
+            from ai.copy_embedding import extract_copy_features
+            copy_views=extract_copy_features(read_image(path),max_views=SSCD_MAX_VIEWS)
+            if copy_views:
+                f["copy_views"]=copy_views
+        except Exception:
+            log.warning("新客户SSCD特征即时生成失败 image=%s；下次启动会自动补索引",image_id,exc_info=True)
     try:
-        save_copy_features(conn,image_id,f.get("copy_views"))
+        if copy_views:
+            save_copy_features(conn,image_id,copy_views)
     except Exception:
-        log.debug("保存SSCD同图特征失败 image=%s",image_id,exc_info=True)
+        log.warning("保存新客户SSCD同图特征失败 image=%s",image_id,exc_info=True)
     if f.get("local"):
         try:
             skp,sdesc,srows,scols,sdtype=pack_local_feature(f["local"]["sift"])
@@ -755,6 +807,18 @@ def reindex_missing_signatures(limit=20):
 
 
 
+
+def count_signature_index_status():
+    """Return (total_images, indexed_images, missing_images) for V1.8 signatures."""
+    conn=get_conn()
+    try:
+        total=int(conn.execute("SELECT COUNT(*) FROM images").fetchone()[0] or 0)
+        indexed=int(conn.execute("SELECT COUNT(DISTINCT image_id) FROM image_signatures").fetchone()[0] or 0)
+        return total,indexed,max(0,total-indexed)
+    finally:
+        conn.close()
+
+
 def reindex_missing_copy_features(limit=6):
     """Background-upgrade old images with task-specific SSCD copy descriptors."""
     conn=get_conn()
@@ -778,7 +842,7 @@ def reindex_missing_copy_features(limit=6):
                 continue
             try:
                 img=read_image(p)
-                views=extract_copy_features(img,max_views=4)
+                views=extract_copy_features(img,max_views=SSCD_MAX_VIEWS)
                 if views:
                     save_copy_features(conn,int(row["id"]),views)
                     done+=1
@@ -812,6 +876,12 @@ def cleanup_orphan_image_files(max_age_hours=24):
             if p: refs.add(str(p.resolve()))
         for r in conn.execute("SELECT file_path FROM pending_buffer WHERE file_path IS NOT NULL").fetchall():
             try: refs.add(str(Path(r["file_path"]).resolve()))
+            except Exception: pass
+        # Keep the submitted query image while a suspect collision still has
+        # review buttons. Otherwise the 24h orphan cleanup could delete it before
+        # a human presses Confirm/False Positive, preventing later alias learning.
+        for r in conn.execute("SELECT query_file_path FROM collision_records WHERE status='pending' AND query_file_path IS NOT NULL").fetchall():
+            try: refs.add(str(Path(r["query_file_path"]).resolve()))
             except Exception: pass
     finally:
         conn.close()
