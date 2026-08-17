@@ -687,14 +687,14 @@ def _insert_image(conn, customer_id, path, file_id, file_unique_id, submitter, s
     return image_id
 
 
-def save_customer_and_image(path,file_id,file_unique_id,submitter,submitter_id,chat_id,customer_data,raw_text,source="live",source_message_id="",object_key=None,features=None):
+def save_customer_and_image(path,file_id,file_unique_id,submitter,submitter_id,chat_id,customer_data,raw_text,source="live",source_message_id="",object_key=None,features=None,prechecked_new=False):
     # Serialize formal customer creation. This closes the race where two staff
     # submit the same new photo at nearly the same time and both saw "new".
     with _SAVE_LOCK:
         # Handler has already run the full detector and passes its features.
         # Re-running SSCD/SIFT here would double latency. Only callers that did
         # not provide prechecked features need a second full duplicate check.
-        if source == "live" and features is None:
+        if source == "live" and features is None and not prechecked_new:
             latest = check_image(path)
             if latest.get("type") == "same":
                 conn=get_conn(); row=conn.execute("SELECT id,customer_id FROM images WHERE id=?",(latest["matched_image_id"],)).fetchone(); conn.close()

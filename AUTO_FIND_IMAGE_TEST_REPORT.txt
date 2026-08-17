@@ -1,0 +1,11 @@
+V1.9.7 AUTO-FIND-IMAGE 测试
+
+[PASS] 全项目 Python compileall
+[PASS] SQLite 旧库自动新增 message_image_links 表
+[PASS] message_id -> source image file_id 写入/读取
+[PASS] recent image link 按群+发送者检索
+[PASS] “政府文职有人聊过吗”识别为图片查询语句
+[PASS] 客户资料文本不会被误识别为查询语句
+[PASS] Railway /data 数据库迁移无需重新导入客户
+
+说明：Telegram Bot API 无法主动翻查任意旧群历史。V1.9.7 从部署后开始持久记录图片与相关查询消息的映射；已经存在但此前从未被机器人记录的很老查询文字，若 Telegram 回复对象本身不含图片且本地没有旧缓冲，则无法凭空追溯更早消息。

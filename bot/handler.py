@@ -3,6 +3,7 @@
 """
 import asyncio
 import logging
+import re
 from functools import partial
 from pathlib import Path
 
@@ -11,7 +12,10 @@ from telegram.ext import ContextTypes
 
 from config import IMAGE_DIR, IMPORT_DIR, OCR_FALLBACK, IMPORT_ADMINS_ONLY, IMAGE_CHECK_TIMEOUT, MAX_CONCURRENT_IMAGE_CHECKS, AUTO_COLLISION_THRESHOLD, MAX_IMAGE_BYTES, SHOW_MATCHED_IMAGE
 from core.customer import parse_customer_info, is_customer_record, public_customer_data
-from core.database import get_conn, save_pending_buffer, delete_pending_buffer, load_pending_buffers, cleanup_expired_pending_buffers
+from core.database import (
+    get_conn, save_pending_buffer, delete_pending_buffer, load_pending_buffers, cleanup_expired_pending_buffers,
+    save_message_image_link, get_message_image_link, get_recent_message_image_link, update_message_image_check,
+)
 from core.object_storage import upload_image, image_object_key
 from core.notify import notify_dashboard_update
 from ocr.extractor import extract_text, likely_contains_text
@@ -62,6 +66,250 @@ FIELD_LABELS: dict[str, str] = {
 # 中文标签 → 数据库字段名
 FIELD_KEY_MAP: dict[str, str] = {v: k for k, v in FIELD_LABELS.items()}
 
+# Query-like text often follows a customer image and is later replied to with the
+# formal profile. Persisting that relation lets the bot recover the original image
+# without asking staff to send it again.
+_QUERY_LINK_TTL = 15 * 60
+_QUERY_HINT_RE = re.compile(
+    r"(聊过|聊過|有聊|有人|撞客|撞过|撞過|熟悉|见过|見過|认识|認識|头像|頭像|这个|這個|有冇|有没有|有沒有|吗\s*$|嗎\s*$|\?\s*$|？\s*$)",
+    re.I,
+)
+
+
+def _message_image_media(message):
+    """Return the Telegram PhotoSize/Document when a message directly contains an image."""
+    if not message:
+        return None
+    photos = getattr(message, "photo", None) or []
+    if photos:
+        return photos[-1]
+    doc = getattr(message, "document", None)
+    if doc:
+        mime = (getattr(doc, "mime_type", None) or "").lower()
+        name = (getattr(doc, "file_name", None) or "").lower()
+        if mime.startswith("image/") or name.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".avif")):
+            return doc
+    return None
+
+
+def _looks_like_image_query_text(text: str) -> bool:
+    text = (text or "").strip()
+    return bool(text and len(text) <= 120 and _QUERY_HINT_RE.search(text))
+
+
+async def _persist_source_image_link(chat, message, media, path=None) -> None:
+    """Remember an image message by Telegram file_id so it can be re-downloaded later."""
+    if not chat or not message or not media:
+        return
+    owner = getattr(message, "from_user", None)
+    try:
+        await _run_sync(
+            save_message_image_link,
+            str(chat.id), str(message.message_id), str(message.message_id),
+            str(media.file_id), str(getattr(media, "file_unique_id", "") or ""),
+            str(getattr(owner, "id", "") or ""), _user_name(owner), str(path or ""),
+        )
+    except Exception:
+        log.warning("保存消息→图片长期关联失败 message_id=%s", getattr(message, "message_id", None), exc_info=True)
+
+
+async def _link_context_text_to_source_image(msg, chat, user) -> None:
+    """Map a short query text to the image it refers to.
+
+    Example:
+        [photo]
+        政府文职有人聊过吗
+        (later) reply to that text with 姓名/年龄/职业...
+
+    The later profile can then recover the photo even after the one-hour pending
+    buffer expired or the process restarted.
+    """
+    text = (getattr(msg, "text", None) or "").strip()
+    if not _looks_like_image_query_text(text):
+        return
+
+    link = None
+    replied = getattr(msg, "reply_to_message", None)
+    media = _message_image_media(replied)
+    if media is not None:
+        owner = getattr(replied, "from_user", None)
+        try:
+            link = await _run_sync(get_message_image_link, str(chat.id), str(replied.message_id))
+        except Exception:
+            link = None
+        if not link:
+            link = {
+                "source_image_message_id": str(replied.message_id),
+                "file_id": str(media.file_id),
+                "file_unique_id": str(getattr(media, "file_unique_id", "") or ""),
+                "owner_user_id": str(getattr(owner, "id", "") or ""),
+                "owner_name": _user_name(owner),
+                "file_path": "",
+            }
+    elif replied is not None:
+        try:
+            link = await _run_sync(get_message_image_link, str(chat.id), str(replied.message_id))
+        except Exception:
+            link = None
+
+    # Common group workflow: photo first, then a short separate question from the
+    # same staff member. Link only a recent image to avoid cross-customer guesses.
+    if link is None:
+        try:
+            link = await _run_sync(
+                get_recent_message_image_link, str(chat.id), str(user.id), _QUERY_LINK_TTL
+            )
+        except Exception:
+            link = None
+
+    if not link or not link.get("file_id"):
+        return
+    try:
+        await _run_sync(
+            save_message_image_link,
+            str(chat.id), str(msg.message_id), str(link.get("source_image_message_id") or msg.message_id),
+            str(link["file_id"]), str(link.get("file_unique_id") or ""),
+            str(link.get("owner_user_id") or user.id), str(link.get("owner_name") or _user_name(user)),
+            str(link.get("file_path") or ""), str(link.get("check_status") or ""),
+            link.get("matched_image_id"), str(link.get("match_type") or ""),
+            link.get("score"), str(link.get("checked_time") or ""),
+        )
+        log.info("[entry-link] 已把查询文字 message_id=%s 关联到图片 message_id=%s", msg.message_id, link.get("source_image_message_id"))
+    except Exception:
+        log.warning("保存查询文字→图片关联失败", exc_info=True)
+
+
+async def _entry_from_image_reference(
+    msg, context, chat, user, info, raw_text,
+    *, file_id: str, file_unique_id: str = "", source_message_id: str = "",
+    file_path: str = "", owner_user_id: str = "", owner_name: str = "",
+    previous_status: str = "", previous_matched_image_id: int | None = None,
+    previous_match_type: str = "", previous_score: float | None = None,
+) -> bool:
+    """Re-download/recheck an already-sent image and combine it with customer data.
+
+    Returns True when an image reference was usable and the request was fully
+    handled (new customer, collision, suspect, or a visible processing error).
+    """
+    if not file_id:
+        return False
+
+    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    fuid = file_unique_id or file_id
+    path = Path(file_path) if file_path else IMAGE_DIR / f"{fuid}.jpg"
+    if not path.exists():
+        try:
+            tgfile = await context.bot.get_file(file_id)
+            await tgfile.download_to_drive(path)
+        except Exception:
+            log.warning("无法从 Telegram 重新下载自动找到的客户图片 file_id=%s", file_id, exc_info=True)
+            await msg.reply_text("⚠️ 已找到原图片记录，但暂时无法从 Telegram 重新读取图片，请稍后再试。")
+            return True
+
+    # V1.9.8: formal profile data never causes the earlier query text itself to enter the DB.
+    # If the source image was already checked as NEW, staff do not need another image or
+    # another full collision scan: combine the formal data with that already-cleared image
+    # and save it immediately. New customer SSCD/features are still generated on insert.
+    if str(previous_status or "").lower() == "new":
+        saved = await _save_group_customer(
+            msg, str(file_id), str(file_unique_id or ""), path, user, chat, info, raw_text,
+            source_message_id=str(source_message_id or msg.message_id), prechecked_new=True,
+        )
+        if saved and source_message_id:
+            await _clear_pending_image_for_message(str(chat.id), str(source_message_id), context)
+        return True
+
+    # If the earlier check was a confirmed collision, never create a new customer from
+    # later profile text. Show the already matched historical customer instead.
+    if str(previous_status or "").lower() == "collision" and previous_matched_image_id:
+        matched = await _run_sync(_get_matched_customer, int(previous_matched_image_id))
+        score = float(previous_score or 100.0)
+        text = f"🔴 撞客\n\n匹配类型：{previous_match_type or '历史已确认撞客'}\n相似度：{score:.2f}%"
+        if matched and matched.get("name"):
+            text += f"\n已有客户：{matched['name']}"
+            extra = _format_customer_summary(matched)
+            if extra:
+                text += f"\n{extra}"
+        await _reply_match_result_with_history(msg, text, int(previous_matched_image_id))
+        return True
+
+    try:
+        async with _IMAGE_CHECK_SEMAPHORE:
+            result = await asyncio.wait_for(_run_sync(check_image, path), timeout=IMAGE_CHECK_TIMEOUT)
+    except asyncio.TimeoutError:
+        await msg.reply_text("❌ 自动找到图片后检测超时，请稍后重试")
+        return True
+    except Exception:
+        log.exception("自动找到图片后的撞客检测失败")
+        await msg.reply_text("❌ 自动找到图片后检测失败，请稍后重试")
+        return True
+
+    log.info("[entry-link] 自动找到图片并检测 type=%s score=%s source_message_id=%s", result.get("type"), result.get("score"), source_message_id)
+
+    if result.get("type") == "same":
+        matched = await _run_sync(_get_matched_customer, result["matched_image_id"])
+        text = "🔴 撞客\n\n匹配类型：同一图片\n相似度：100%"
+        if matched and matched.get("name"):
+            text += f"\n已有客户：{matched['name']}"
+            extra = _format_customer_summary(matched)
+            if extra:
+                text += f"\n{extra}"
+        await _reply_match_result_with_history(msg, text, result["matched_image_id"])
+        return True
+
+    if result.get("type") == "similar":
+        matched = await _run_sync(_get_matched_customer, result["matched_image_id"])
+        collision_id = await _run_sync(
+            create_collision,
+            result["features"]["sha256"], result["matched_image_id"], _user_name(user), str(user.id), str(chat.id),
+            result["match_type"], result["score"], result["features"].get("phash", ""), str(path),
+            str(file_id), str(file_unique_id or ""),
+            next((x.get("feature") for x in (result.get("features", {}).get("copy_views") or []) if x.get("feature") is not None), None),
+            public_customer_data(info), raw_text, str(source_message_id or msg.message_id),
+        )
+        score = float(result.get("score") or 0.0)
+        if score >= AUTO_COLLISION_THRESHOLD:
+            await _run_sync(confirm_collision, collision_id, "confirmed", "系统自动确认", "system")
+            if result.get("learn_safe"):
+                try:
+                    await _run_sync(
+                        save_image_alias, path, result["matched_image_id"], str(file_id), str(file_unique_id or ""),
+                        _user_name(user), str(user.id), str(chat.id), "auto_alias", None, result.get("features"),
+                    )
+                except Exception:
+                    log.warning("自动找到图片后保存撞客别名失败", exc_info=True)
+            text = f"🔴 撞客\n\n匹配类型：{result['match_type']}\n相似度：{score:.2f}%"
+            if matched and matched.get("name"):
+                text += f"\n已有客户：{matched['name']}"
+                extra = _format_customer_summary(matched)
+                if extra:
+                    text += f"\n{extra}"
+            text += f"\n\n✅ 已自动确认撞客（≥{AUTO_COLLISION_THRESHOLD:.0f}%）"
+            await _reply_match_result_with_history(msg, text, result["matched_image_id"])
+            return True
+
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ 确认撞客", callback_data=f"collision:confirmed:{collision_id}"),
+            InlineKeyboardButton("❌ 误判", callback_data=f"collision:false_positive:{collision_id}"),
+        ]])
+        text = f"🟠 疑似撞客\n\n匹配类型：{result['match_type']}\n相似度：{score:.2f}%"
+        if matched and matched.get("name"):
+            text += f"\n已有客户：{matched['name']}"
+            extra = _format_customer_summary(matched)
+            if extra:
+                text += f"\n{extra}"
+        await _reply_match_result_with_history(msg, text, result["matched_image_id"], reply_markup=kb)
+        return True
+
+    # New image: customer data already exists, so formal entry happens immediately.
+    saved = await _save_group_customer(
+        msg, str(file_id), str(file_unique_id or ""), path, user, chat, info, raw_text,
+        features=result.get("features"), source_message_id=str(source_message_id or msg.message_id),
+    )
+    if saved and source_message_id:
+        await _clear_pending_image_for_message(str(chat.id), str(source_message_id), context)
+    return True
+
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -97,6 +345,11 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     log.info("[photo] 下载完成 chat_type=%s file=%s edited=%s", chat.type, photo.file_id, bool(update.edited_message))
 
+    # Every received image gets a persistent Telegram file_id link. This is tiny
+    # metadata (not a second image copy) and allows later profile replies to find
+    # the original picture without asking staff to resend it.
+    await _persist_source_image_link(chat, msg, photo, path)
+
     # V1.9.6：图片备注（caption）在任何检测分支前先解析。
     # 这样即使图片后来进入“疑似撞客→人工误判”流程，客户资料也不会丢。
     caption_raw = (msg.caption or "").strip()
@@ -122,6 +375,24 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     log.info("[photo] 检测完成 type=%s score=%s", result.get("type"), result.get("score"))
+
+    # Persist the check outcome on the source image. Short query text that is later
+    # linked to this image inherits the same result, but QUERY TEXT ITSELF NEVER ENTERS DB.
+    try:
+        _rtype = str(result.get("type") or "")
+        _rscore = float(result.get("score") or (100.0 if _rtype == "same" else 0.0))
+        if _rtype == "same":
+            _check_status = "collision"
+        elif _rtype == "similar":
+            _check_status = "collision" if _rscore >= AUTO_COLLISION_THRESHOLD else "suspect"
+        else:
+            _check_status = "new"
+        await _run_sync(
+            update_message_image_check, str(chat.id), str(msg.message_id), _check_status,
+            result.get("matched_image_id"), str(result.get("match_type") or ""), _rscore,
+        )
+    except Exception:
+        log.warning("保存图片既有查撞结果失败 message_id=%s", msg.message_id, exc_info=True)
 
     # 同一图片：私聊→显示摘要+覆盖按钮；群聊→报撞
     if result["type"] == "same":
@@ -499,7 +770,7 @@ async def _notify_pending_text_expired(context: ContextTypes.DEFAULT_TYPE):
     await _do_expire_pending_text(data["chat_id"], data["user_id"], data["gen"], context.bot)
 
 
-async def _save_group_customer(msg, file_id, file_unique_id, path, user, chat, info, raw_text, obj_key=None, features=None) -> bool:
+async def _save_group_customer(msg, file_id, file_unique_id, path, user, chat, info, raw_text, obj_key=None, features=None, source_message_id=None, prechecked_new=False) -> bool:
     """群聊新客户入库公共逻辑（被 photo_handler 和 text_handler 共用）。
 
     返回 True  — 操作已终止（入库成功 或 重复图片），调用方可安全删除缓冲记录。
@@ -518,7 +789,7 @@ async def _save_group_customer(msg, file_id, file_unique_id, path, user, chat, i
             path, file_id, file_unique_id,
             _user_name(user), str(user.id), str(chat.id),
             public_customer_data(info), raw_text,
-            "group", str(msg.message_id), obj_key, features,
+            "group", str(source_message_id or msg.message_id), obj_key, features, prechecked_new,
         )
     except Exception:
         log.exception("群聊入库失败")
@@ -536,7 +807,7 @@ async def _save_group_customer(msg, file_id, file_unique_id, path, user, chat, i
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """监听群聊客户资料：支持同消息、先图后文、先文后图，以及跨发送者“回复图片补资料”。"""
+    """监听群聊客户资料：支持同消息、先图后文、先文后图、回复图片，以及回复“图片后的查询文字”自动找回原图。"""
     import time
     msg = update.effective_message
     if not msg or not msg.text:
@@ -552,6 +823,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_text = msg.text.strip()
     info = parse_customer_info(raw_text)
     if not is_customer_record(info):
+        # A short query message sent after/replying to a photo becomes a persistent
+        # bridge to that image. Later customer data can reply to the query text and
+        # the bot will automatically recover the original photo.
+        await _link_context_text_to_source_image(msg, chat, user)
         return
 
     key = (str(chat.id), str(user.id))
@@ -561,6 +836,53 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_mid = str(msg.reply_to_message.message_id)
     except Exception:
         reply_mid = None
+    # V1.9.7: formal data that replies to an old image/query should not ask staff
+    # to resend the photo. First use the replied Telegram media itself; if the
+    # reply target is a text query, resolve its persistent message→image link.
+    if reply_mid and msg.reply_to_message is not None:
+        replied_media = _message_image_media(msg.reply_to_message)
+        if replied_media is not None:
+            replied_owner = getattr(msg.reply_to_message, "from_user", None)
+            try:
+                _direct_link = await _run_sync(get_message_image_link, str(chat.id), reply_mid)
+            except Exception:
+                _direct_link = None
+            handled = await _entry_from_image_reference(
+                msg, context, chat, user, info, raw_text,
+                file_id=str(replied_media.file_id),
+                file_unique_id=str(getattr(replied_media, "file_unique_id", "") or ""),
+                source_message_id=reply_mid,
+                owner_user_id=str(getattr(replied_owner, "id", "") or ""),
+                owner_name=_user_name(replied_owner),
+                previous_status=str((_direct_link or {}).get("check_status") or ""),
+                previous_matched_image_id=(_direct_link or {}).get("matched_image_id"),
+                previous_match_type=str((_direct_link or {}).get("match_type") or ""),
+                previous_score=(_direct_link or {}).get("score"),
+            )
+            if handled:
+                return
+
+        try:
+            persisted_link = await _run_sync(get_message_image_link, str(chat.id), reply_mid)
+        except Exception:
+            persisted_link = None
+        if persisted_link and persisted_link.get("file_id"):
+            handled = await _entry_from_image_reference(
+                msg, context, chat, user, info, raw_text,
+                file_id=str(persisted_link.get("file_id") or ""),
+                file_unique_id=str(persisted_link.get("file_unique_id") or ""),
+                source_message_id=str(persisted_link.get("source_image_message_id") or reply_mid),
+                file_path=str(persisted_link.get("file_path") or ""),
+                owner_user_id=str(persisted_link.get("owner_user_id") or ""),
+                owner_name=str(persisted_link.get("owner_name") or ""),
+                previous_status=str(persisted_link.get("check_status") or ""),
+                previous_matched_image_id=persisted_link.get("matched_image_id"),
+                previous_match_type=str(persisted_link.get("match_type") or ""),
+                previous_score=persisted_link.get("score"),
+            )
+            if handled:
+                return
+
     entry = None
     if reply_mid:
         # 先允许“跨发送者回复绑定”：A 发图，B 回复该图发资料，也视为同一客户。
@@ -724,6 +1046,21 @@ async def collision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not ok:
             await q.answer("该记录已被其他人处理", show_alert=True)
             return
+
+        # The original query image's reusable state follows human review.
+        # false_positive means “之前没有撞客”, so later formal profile text can
+        # directly save that already-cleared image without asking for another photo.
+        try:
+            _src_mid = str(collision.get("query_source_message_id") or "")
+            if _src_mid:
+                await _run_sync(
+                    update_message_image_check, str(collision.get("chat_id") or chat.id), _src_mid,
+                    "new" if status == "false_positive" else "collision",
+                    collision.get("matched_image_id") if status != "false_positive" else None,
+                    str(collision.get("match_type") or ""), float(collision.get("score") or 0.0),
+                )
+        except Exception:
+            log.warning("更新人工审核后的图片查撞状态失败", exc_info=True)
 
         if status == "confirmed" and collision:
             try:

@@ -304,6 +304,30 @@ def init_db() -> None:
         """)
 
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS message_image_links(
+            chat_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            source_image_message_id TEXT,
+            file_id TEXT NOT NULL,
+            file_unique_id TEXT,
+            owner_user_id TEXT,
+            owner_name TEXT,
+            file_path TEXT,
+            check_status TEXT,
+            matched_image_id INTEGER,
+            match_type TEXT,
+            score REAL,
+            checked_time TEXT,
+            created_time TEXT,
+            PRIMARY KEY(chat_id, message_id)
+        )
+        """)
+        _ensure_columns(conn, "message_image_links", {
+            "check_status":"TEXT", "matched_image_id":"INTEGER", "match_type":"TEXT",
+            "score":"REAL", "checked_time":"TEXT",
+        })
+
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS crash_logs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             exc_type TEXT,
@@ -330,6 +354,8 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_pending_buffer_user ON pending_buffer(buffer_type, chat_id, user_id, ts)",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_buffer_message ON pending_buffer(buffer_type, chat_id, message_id) WHERE message_id IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_crash_logs_created ON crash_logs(created_time)",
+            "CREATE INDEX IF NOT EXISTS idx_message_image_links_owner ON message_image_links(chat_id,owner_user_id,created_time)",
+            "CREATE INDEX IF NOT EXISTS idx_message_image_links_source ON message_image_links(chat_id,source_image_message_id)",
             "CREATE INDEX IF NOT EXISTS idx_sig_image ON image_signatures(image_id)",
             "CREATE INDEX IF NOT EXISTS idx_false_query ON false_positive_pairs(query_sha256)",
             "CREATE INDEX IF NOT EXISTS idx_false_match ON false_positive_pairs(matched_image_id)",
@@ -464,3 +490,134 @@ def load_pending_buffers() -> list:
             entry["info"] = {}
         result.append(entry)
     return result
+
+
+def save_message_image_link(
+    chat_id: str,
+    message_id: str,
+    source_image_message_id: str,
+    file_id: str,
+    file_unique_id: str = "",
+    owner_user_id: str = "",
+    owner_name: str = "",
+    file_path: str = "",
+    check_status: str = "",
+    matched_image_id: int | None = None,
+    match_type: str = "",
+    score: float | None = None,
+    checked_time: str = "",
+) -> None:
+    """Persist a lightweight mapping from a related Telegram message to its source image.
+
+    V1.9.8 also stores the last known collision-check outcome. Query text itself
+    never creates a customer; it only inherits the source image's check state.
+    """
+    if not chat_id or not message_id or not file_id:
+        return
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO message_image_links(
+                   chat_id,message_id,source_image_message_id,file_id,file_unique_id,owner_user_id,owner_name,file_path,
+                   check_status,matched_image_id,match_type,score,checked_time,created_time
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(chat_id,message_id) DO UPDATE SET
+                   source_image_message_id=excluded.source_image_message_id,
+                   file_id=excluded.file_id,
+                   file_unique_id=excluded.file_unique_id,
+                   owner_user_id=excluded.owner_user_id,
+                   owner_name=excluded.owner_name,
+                   file_path=CASE WHEN excluded.file_path<>'' THEN excluded.file_path ELSE message_image_links.file_path END,
+                   check_status=CASE WHEN excluded.check_status<>'' THEN excluded.check_status ELSE message_image_links.check_status END,
+                   matched_image_id=COALESCE(excluded.matched_image_id,message_image_links.matched_image_id),
+                   match_type=CASE WHEN excluded.match_type<>'' THEN excluded.match_type ELSE message_image_links.match_type END,
+                   score=COALESCE(excluded.score,message_image_links.score),
+                   checked_time=CASE WHEN excluded.checked_time<>'' THEN excluded.checked_time ELSE message_image_links.checked_time END,
+                   created_time=excluded.created_time""",
+            (
+                str(chat_id), str(message_id), str(source_image_message_id or message_id),
+                str(file_id), str(file_unique_id or ""), str(owner_user_id or ""),
+                str(owner_name or ""), str(file_path or ""), str(check_status or ""),
+                int(matched_image_id) if matched_image_id is not None else None,
+                str(match_type or ""), float(score) if score is not None else None,
+                str(checked_time or ""), now_iso(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_message_image_check(
+    chat_id: str,
+    source_image_message_id: str,
+    check_status: str,
+    matched_image_id: int | None = None,
+    match_type: str = "",
+    score: float | None = None,
+) -> None:
+    """Update the source image and every linked query-message with the latest check result."""
+    if not chat_id or not source_image_message_id:
+        return
+    conn = get_conn()
+    try:
+        conn.execute(
+            """UPDATE message_image_links
+               SET check_status=?, matched_image_id=?, match_type=?, score=?, checked_time=?
+               WHERE chat_id=? AND (message_id=? OR source_image_message_id=?)""",
+            (
+                str(check_status or ""),
+                int(matched_image_id) if matched_image_id is not None else None,
+                str(match_type or ""),
+                float(score) if score is not None else None,
+                now_iso(), str(chat_id), str(source_image_message_id), str(source_image_message_id),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_message_image_link(chat_id: str, message_id: str) -> dict | None:
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM message_image_links WHERE chat_id=? AND message_id=? LIMIT 1",
+            (str(chat_id), str(message_id)),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_recent_message_image_link(chat_id: str, owner_user_id: str, max_age_sec: float = 900.0) -> dict | None:
+    """Return the most recent source-image link for a sender, constrained by age.
+
+    Used only to associate short query text such as “这个有人聊过吗” with the
+    image that immediately preceded it. Formal customer data itself is never
+    guessed from an unrelated user's image.
+    """
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            """SELECT * FROM message_image_links
+               WHERE chat_id=? AND owner_user_id=?
+               ORDER BY rowid DESC LIMIT 1""",
+            (str(chat_id), str(owner_user_id)),
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        created = str(item.get("created_time") or "")
+        if max_age_sec and created:
+            try:
+                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc) - dt).total_seconds() > float(max_age_sec):
+                    return None
+            except Exception:
+                pass
+        return item
+    finally:
+        conn.close()

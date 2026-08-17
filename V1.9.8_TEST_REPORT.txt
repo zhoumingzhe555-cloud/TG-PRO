@@ -1,0 +1,16 @@
+V1.9.8 PRECHECKED-NEW DIRECT-ENTRY 测试报告
+
+已验证：
+1. Python 全项目 compileall 通过。
+2. message_image_links 数据库自动迁移新增 check_status / matched_image_id / match_type / score / checked_time。
+3. 原图片 check_status=new 可持久保存。
+4. “有人聊过吗”等查询文字关联原图片后可继承 source_image_message_id 与 new 状态；查询文字本身不建客户。
+5. 人工审核后状态可更新：误判 -> new；确认撞客 -> collision。
+6. prechecked_new=True 时 save_customer_and_image 不再次执行 check_image；仍正常建立客户、图片和即时特征。
+7. 查询文字与源图片的状态更新可按 source_image_message_id 同步传播。
+
+规则：
+- 查询消息：永不入库。
+- 正式客户资料到达 + 自动找到原图 + 原图此前检测为 NEW：直接入库。
+- 原图此前已确认撞客：不入库。
+- 原图此前疑似：继续审核；误判后状态变 NEW。
