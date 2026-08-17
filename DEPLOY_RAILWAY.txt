@@ -1,0 +1,29 @@
+TG Anti-Collision Bot V1.7 - GitHub + Railway
+
+1. Upload ALL files and folders from this package to the ROOT of a GitHub repository.
+   Do not upload this ZIP itself as the only repository file.
+
+2. Create a Railway service from that GitHub repository.
+
+3. Railway Variables:
+   BOT_TOKEN=<your Telegram bot token>
+   DATA_DIR=/data
+
+4. Add a Railway Volume and mount it at:
+   /data
+
+5. Keep the Railway service at 1 replica (Telegram long polling).
+
+6. Telegram group setup:
+   - Add the bot to the group.
+   - Make it an administrator, OR disable BotFather Privacy Mode so it can receive ordinary group photos.
+   - Private chat is intentionally disabled.
+
+7. History import:
+   - Group administrators can send supported ZIP/JSON/HTML files to the group.
+   - V1.7 compact bundles contain history_manifest.json + photos/.
+   - One imported photo creates one customer even if no customer profile text exists.
+   - Exact duplicate photos are skipped as duplicates.
+
+Expected startup log:
+TG防撞客机器人 V1.7 ONE-PHOTO-ONE-CUSTOMER GitHub + Railway 启动（群聊专用 / 私聊关闭）

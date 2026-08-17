@@ -1,0 +1,6 @@
+TG Anti-Collision Bot
+Version: 1.7 ONE-PHOTO-ONE-CUSTOMER
+Target: GitHub + Railway
+Private chat: disabled
+History rule: one imported photo = one customer, customer profile optional
+Storage: Railway SQLite + Volume at /data
