@@ -79,7 +79,7 @@ def load_copy_features(conn, image_ids: list[int] | set[int]) -> dict[int, list[
         chunk = ids[start:start + step]
         ph = ",".join("?" * len(chunk))
         rows = conn.execute(
-            f"SELECT image_id,kind,feature,dim FROM image_copy_features WHERE image_id IN ({ph})",
+            f"SELECT c.image_id,c.kind,c.feature,c.dim FROM image_copy_features c JOIN images i ON i.id=c.image_id WHERE COALESCE(i.trusted,1)=1 AND c.image_id IN ({ph})",
             chunk,
         ).fetchall()
         for r in rows:
@@ -171,13 +171,13 @@ def copy_candidate_scores(conn, query_views: list[dict], top_k: int | None = Non
     if qmat is None:
         return []
     top_k = max(1, int(top_k or SSCD_TOP_K))
-    count = int(conn.execute("SELECT COUNT(DISTINCT image_id) FROM image_copy_features").fetchone()[0] or 0)
+    count = int(conn.execute("SELECT COUNT(DISTINCT c.image_id) FROM image_copy_features c JOIN images i ON i.id=c.image_id WHERE COALESCE(i.trusted,1)=1").fetchone()[0] or 0)
     if count <= 0:
         return []
 
     image_best: dict[int, tuple[float, str]] = {}
     if count <= int(SSCD_FULL_SCAN_LIMIT):
-        cur = conn.execute("SELECT image_id,kind,feature,dim FROM image_copy_features")
+        cur = conn.execute("SELECT c.image_id,c.kind,c.feature,c.dim FROM image_copy_features c JOIN images i ON i.id=c.image_id WHERE COALESCE(i.trusted,1)=1")
         while True:
             rows = cur.fetchmany(1000)
             if not rows:
@@ -192,7 +192,7 @@ def copy_candidate_scores(conn, query_views: list[dict], top_k: int | None = Non
             chunk = ids[start:start + step]
             ph = ",".join("?" * len(chunk))
             rows = conn.execute(
-                f"SELECT image_id,kind,feature,dim FROM image_copy_features WHERE image_id IN ({ph})",
+                f"SELECT c.image_id,c.kind,c.feature,c.dim FROM image_copy_features c JOIN images i ON i.id=c.image_id WHERE COALESCE(i.trusted,1)=1 AND c.image_id IN ({ph})",
                 chunk,
             ).fetchall()
             _score_rows(rows, qmat, image_best, top_k)

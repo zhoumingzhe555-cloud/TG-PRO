@@ -138,37 +138,115 @@ def _load_signature_map(conn, ids):
 
 
 def _full_light_rows(conn):
-    return conn.execute("SELECT id,phash,dhash,roi_phash,customer_id,ai_hash FROM images ORDER BY id DESC LIMIT ?", (FULL_LIGHT_SCAN_LIMIT,)).fetchall()
+    return conn.execute("SELECT id,phash,dhash,roi_phash,customer_id,ai_hash FROM images WHERE COALESCE(trusted,1)=1 ORDER BY id DESC LIMIT ?", (FULL_LIGHT_SCAN_LIMIT,)).fetchall()
 
 
 def _fetch_deep(conn, ids):
     if not ids: return {}
     ph=','.join('?'*len(ids))
-    rows=conn.execute(f"SELECT id,file_path,customer_id,color_hist,orb_desc,orb_rows,ai_feature FROM images WHERE id IN ({ph})", ids).fetchall()
+    rows=conn.execute(f"SELECT id,file_path,customer_id,color_hist,orb_desc,orb_rows,ai_feature FROM images WHERE COALESCE(trusted,1)=1 AND id IN ({ph})", ids).fetchall()
     return {int(r["id"]):r for r in rows}
 
 
-def _match_descriptors(qf, cf, norm):
+def _hull_coverage(points, shape):
+    if points is None or len(points) < 3 or shape is None:
+        return 0.0
+    try:
+        pts=np.asarray(points,dtype=np.float32).reshape(-1,2)
+        hull=cv2.convexHull(pts)
+        area=float(abs(cv2.contourArea(hull)))
+        h,w=shape[:2]
+        return max(0.0,min(1.0,area/max(1.0,float(h*w))))
+    except Exception:
+        return 0.0
+
+
+def _homography_sane(H, qshape, cshape):
+    if H is None or qshape is None or cshape is None:
+        return False
+    try:
+        if not np.isfinite(H).all():
+            return False
+        H=np.asarray(H,dtype=np.float64)
+        if abs(H[2,2]) < 1e-10:
+            return False
+        H=H/H[2,2]
+        # Reject extremely ill-conditioned transforms commonly produced by
+        # repetitive backgrounds (wood slats, fences, text rows, leaves, etc.).
+        if np.linalg.cond(H) > 2e5:
+            return False
+        qh,qw=qshape[:2]; ch,cw=cshape[:2]
+        corners=np.float32([[0,0],[qw,0],[qw,qh],[0,qh]]).reshape(-1,1,2)
+        proj=cv2.perspectiveTransform(corners,H).reshape(-1,2)
+        if not np.isfinite(proj).all():
+            return False
+        hull=cv2.convexHull(proj.astype(np.float32))
+        area=float(abs(cv2.contourArea(hull)))
+        cand_area=max(1.0,float(ch*cw))
+        ratio=area/cand_area
+        # A crop may legitimately occupy a small region, but degenerate
+        # near-zero or astronomically large projections are not real copies.
+        if ratio < 0.01 or ratio > 25.0:
+            return False
+        # The projected quadrilateral must remain convex and non-degenerate.
+        if len(hull) < 4:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _match_descriptors(qf, cf, norm, qshape=None, cshape=None):
     qd=qf.get("desc"); cd=cf.get("desc")
-    if qd is None or cd is None or len(qd)<4 or len(cd)<4: return {"score":0.0,"inliers":0,"ratio":0.0,"H":None}
+    empty={"score":0.0,"inliers":0,"ratio":0.0,"H":None,"mutual":0,
+           "coverage_q":0.0,"coverage_c":0.0,"homography_sane":False}
+    if qd is None or cd is None or len(qd)<6 or len(cd)<6:
+        return empty
     try:
         bf=cv2.BFMatcher(norm)
-        pairs=bf.knnMatch(qd,cd,k=2)
-        good=[p[0] for p in pairs if len(p)==2 and p[0].distance < 0.75*p[1].distance]
-        if len(good)<4: return {"score":min(65.0,len(good)*10.0),"inliers":0,"ratio":0.0,"H":None}
+        # Bidirectional Lowe-ratio matching. Requiring mutual correspondence
+        # sharply reduces false geometry on repetitive textures.
+        fwd=bf.knnMatch(qd,cd,k=2)
+        rev=bf.knnMatch(cd,qd,k=2)
+        fgood={(m.queryIdx,m.trainIdx):m for pair in fwd if len(pair)==2
+               for m in [pair[0]] if m.distance < 0.72*pair[1].distance}
+        rgood={(m.trainIdx,m.queryIdx) for pair in rev if len(pair)==2
+               for m in [pair[0]] if m.distance < 0.72*pair[1].distance}
+        good=[m for key,m in fgood.items() if key in rgood]
+        if len(good)<5:
+            out=dict(empty); out["score"]=min(55.0,len(good)*9.0); out["mutual"]=len(good)
+            return out
         src=np.float32([qf["kp"][m.queryIdx] for m in good]).reshape(-1,1,2)
         dst=np.float32([cf["kp"][m.trainIdx] for m in good]).reshape(-1,1,2)
-        H,mask=cv2.findHomography(src,dst,cv2.RANSAC,4.0)
-        inliers=int(mask.sum()) if mask is not None else 0
+        H,mask=cv2.findHomography(src,dst,cv2.RANSAC,3.5)
+        if mask is None:
+            out=dict(empty); out["mutual"]=len(good); return out
+        keep=mask.ravel().astype(bool)
+        inliers=int(keep.sum())
         ratio=inliers/max(1,len(good))
-        # Strong local geometry quickly reaches 90+, but only with enough inliers.
-        if inliers>=18 and ratio>=0.45: score=min(99.4,92+min(7.4,(inliers-18)*0.25)+ratio*2)
-        elif inliers>=10 and ratio>=0.38: score=min(94.0,84+inliers*0.55+ratio*5)
-        elif inliers>=6 and ratio>=0.30: score=min(88.0,68+inliers*1.7+ratio*8)
-        else: score=min(78.0, len(good)*3.0+ratio*20)
-        return {"score":float(score),"inliers":inliers,"ratio":float(ratio),"H":H}
+        src_in=src.reshape(-1,2)[keep] if inliers else np.empty((0,2),np.float32)
+        dst_in=dst.reshape(-1,2)[keep] if inliers else np.empty((0,2),np.float32)
+        cov_q=_hull_coverage(src_in,qshape)
+        cov_c=_hull_coverage(dst_in,cshape)
+        sane=_homography_sane(H,qshape,cshape)
+        min_cov=min(cov_q,cov_c); max_cov=max(cov_q,cov_c)
+
+        # Strong geometry now requires mutually consistent matches spread over
+        # a meaningful area in both images, not just many points on one fence,
+        # text row, wooden wall, foliage cluster, etc.
+        if sane and inliers>=18 and ratio>=0.52 and min_cov>=0.025 and max_cov>=0.10:
+            score=min(98.8,90.5+min(6.8,(inliers-18)*0.22)+ratio*1.5+min_cov*8)
+        elif sane and inliers>=12 and ratio>=0.45 and min_cov>=0.018 and max_cov>=0.075:
+            score=min(89.5,78+inliers*0.55+ratio*4+min_cov*10)
+        elif sane and inliers>=7 and ratio>=0.35 and min_cov>=0.01:
+            score=min(83.0,62+inliers*1.4+ratio*7+min_cov*10)
+        else:
+            score=min(74.0,len(good)*2.2+ratio*16+min_cov*20)
+        return {"score":float(score),"inliers":inliers,"ratio":float(ratio),"H":H,
+                "mutual":len(good),"coverage_q":float(cov_q),"coverage_c":float(cov_c),
+                "homography_sane":bool(sane)}
     except Exception:
-        return {"score":0.0,"inliers":0,"ratio":0.0,"H":None}
+        return empty
 
 
 def _aligned_ssim(qgray, cgray, H):
@@ -199,8 +277,8 @@ def _geometry_once(query_img, cand_img, query_pre=None, candidate_local=None):
     else:
         qlocal=query_pre["local"]; qg=query_pre["gray"]
     clocal=candidate_local or local_features(cand_img)
-    sift=_match_descriptors(qlocal["sift"],clocal["sift"],cv2.NORM_L2)
-    ak=_match_descriptors(qlocal["akaze"],clocal["akaze"],cv2.NORM_HAMMING)
+    sift=_match_descriptors(qlocal["sift"],clocal["sift"],cv2.NORM_L2,qg.shape,cand_img.shape[:2])
+    ak=_match_descriptors(qlocal["akaze"],clocal["akaze"],cv2.NORM_HAMMING,qg.shape,cand_img.shape[:2])
     best=sift if sift["score"]>=ak["score"] else ak
     best["method"]="SIFT" if best is sift else "AKAZE"
     cg=prepared_gray(cand_img)
@@ -259,7 +337,7 @@ def _geometry_score(query_img, candidate_path: Path, qcache=None, conn=None, ima
             return mirrored
         return normal
     except Exception:
-        return {"score":0.0,"inliers":0,"ratio":0.0,"H":None,"method":"","ssim":0.0,"overlap":0.0}
+        return {"score":0.0,"inliers":0,"ratio":0.0,"H":None,"method":"","ssim":0.0,"overlap":0.0,"mutual":0,"coverage_q":0.0,"coverage_c":0.0,"homography_sane":False}
 
 def _fetch_light_rows_by_ids(conn, ids):
     ids=list({int(x) for x in ids if x is not None})
@@ -269,7 +347,7 @@ def _fetch_light_rows_by_ids(conn, ids):
         chunk=ids[st:st+700]
         ph=','.join('?'*len(chunk))
         out.extend(conn.execute(
-            f"SELECT id,phash,dhash,roi_phash,customer_id,ai_hash FROM images WHERE id IN ({ph})",
+            f"SELECT id,phash,dhash,roi_phash,customer_id,ai_hash FROM images WHERE COALESCE(trusted,1)=1 AND id IN ({ph})",
             chunk,
         ).fetchall())
     return out
@@ -341,7 +419,7 @@ def check_image(path):
     sha256,md5=hash_file_pair(path)
     conn=get_conn()
     try:
-        row=conn.execute("SELECT id FROM images WHERE sha256=? OR md5=? LIMIT 1",(sha256,md5)).fetchone()
+        row=conn.execute("SELECT id FROM images WHERE COALESCE(trusted,1)=1 AND (sha256=? OR md5=?) LIMIT 1",(sha256,md5)).fetchone()
         if row:
             return {
                 "type":"same","score":100.0,"matched_image_id":row["id"],
@@ -371,18 +449,8 @@ def check_image(path):
         pre_ex_images,pre_ex_customers=_false_positive_exclusions(conn,sha256,f.get("phash"),None)
         light=[x for x in light if int(x["row"]["id"]) not in pre_ex_images and (not x["row"]["customer_id"] or int(x["row"]["customer_id"]) not in pre_ex_customers)]
 
-        # pHash can collide badly on flat/simple images. V1.9 never auto-verdicts
-        # low-information images from hash alone.
-        if light and not low_info:
-            top=light[0]
-            if top["p"]>=PHASH_DIRECT_THRESHOLD and max(top["d"],top["roi"])>=90:
-                score=min(99.5,max(90.0+(top["p"]-PHASH_DIRECT_THRESHOLD)*1.5,0.74*top["p"]+0.16*top["d"]+0.10*top["roi"]))
-                return {
-                    "type":"similar","score":round(score,2),"matched_image_id":top["row"]["id"],
-                    "features":f,"match_type":"高度相似图片","strong_match":True,
-                    "learn_safe":True,
-                    "detail":{"phash":round(top["p"],1),"dhash":round(top["d"],1),"geometry":0.0,"orb":0.0,"ai":0.0,"copy_ai":0.0},
-                }
+        # V1.9.1 SAFE: perceptual hashes are recall signals only. They never
+        # auto-confirm a non-exact collision before SSCD/geometry corroboration.
 
         # Deep features now include both legacy MobileNet auxiliary features and
         # task-specific SSCD copy descriptors. SSCD is an independent candidate
@@ -426,7 +494,7 @@ def check_image(path):
             evaluated.append({
                 **item,"deep":deep,"orb":orb,"ai":ai,"copy_ai":copy_ai,"hist":hist,
                 "base":base,"geometry":0.0,"inliers":0,"geom_ratio":0.0,"geom_method":"",
-                "ssim":0.0,"overlap":0.0,
+                "ssim":0.0,"overlap":0.0,"mutual":0,"coverage_q":0.0,"coverage_c":0.0,"homography_sane":False,
             })
         evaluated.sort(key=lambda x:max(x["base"],x["rank"],x["copy_ai"]),reverse=True)
 
@@ -442,6 +510,7 @@ def check_image(path):
                 g=_geometry_score(img,cp,_qgeom_cache,conn=conn,image_id=iid)
                 item["geometry"]=g["score"]; item["inliers"]=g["inliers"]; item["geom_ratio"]=g["ratio"]
                 item["geom_method"]=g.get("method",""); item["ssim"]=g.get("ssim",0.0); item["overlap"]=g.get("overlap",0.0)
+                item["mutual"]=g.get("mutual",0); item["coverage_q"]=g.get("coverage_q",0.0); item["coverage_c"]=g.get("coverage_c",0.0); item["homography_sane"]=bool(g.get("homography_sane",False))
 
         best=None
         for item in evaluated:
@@ -449,19 +518,35 @@ def check_image(path):
                 item["p"]>=92, item["d"]>=90, item["roi"]>=90,
                 item["orb"]>=75, item["geometry"]>=84, item["copy_ai"]>=82,
             ])
-            strong_geometry=item["geometry"]>=90 and item["inliers"]>=10
-            strong_hash=(not low_info and item["p"]>=PHASH_DIRECT_THRESHOLD and max(item["d"],item["roi"])>=90)
-            strong_combo=(not low_info and item["p"]>=90 and item["orb"]>=70 and independent>=2)
-            # SSCD is trained for copy detection. We still demand either very high
-            # SSCD similarity or one independent structural corroborator to guard
-            # against hard-negative/look-alike images.
-            strong_copy=(not low_info and item["copy_ai"]>=82 and (
-                item["geometry"]>=76 or item["p"]>=84 or item["roi"]>=84 or item["orb"]>=62
+            cov_min=min(float(item.get("coverage_q") or 0.0),float(item.get("coverage_c") or 0.0))
+            cov_max=max(float(item.get("coverage_q") or 0.0),float(item.get("coverage_c") or 0.0))
+            geom_structural=bool(
+                item["geometry"]>=90 and item["inliers"]>=16 and item["geom_ratio"]>=0.50
+                and item.get("homography_sane") and cov_min>=0.025 and cov_max>=0.10
+            )
+            # Geometry alone is not enough for AUTO90. It must agree with at least
+            # one independent copy/structure signal; this prevents repetitive
+            # backgrounds from becoming 99% false collisions.
+            strong_geometry=bool(geom_structural and (
+                item["copy_ai"]>=68 or item["p"]>=88 or item["roi"]>=88 or item["ssim"]>=35
             ))
-            very_strong_copy=(not low_info and item["copy_ai"]>=91)
+            # Hashes are recall signals. Auto-confirm from hashes requires SSCD or
+            # strong local structure as corroboration.
+            strong_hash=bool(not low_info and item["p"]>=98 and max(item["d"],item["roi"])>=95
+                             and item["hist"]>=82 and (item["copy_ai"]>=72 or item["orb"]>=72 or item["geometry"]>=82))
+            strong_combo=bool(not low_info and item["p"]>=92 and item["orb"]>=72
+                              and (item["copy_ai"]>=66 or item["geometry"]>=72) and independent>=3)
+            # Task-specific copy AI is powerful, but semantic look-alikes must not
+            # auto-cross 90 without independent visual structure.
+            strong_copy=bool(not low_info and item["copy_ai"]>=84 and (
+                item["geometry"]>=72 or item["p"]>=84 or item["roi"]>=84 or item["orb"]>=66
+            ))
+            very_strong_copy=bool(not low_info and item["copy_ai"]>=94 and (
+                item["p"]>=78 or item["roi"]>=78 or item["orb"]>=55 or item["geometry"]>=60 or item["hist"]>=90
+            ))
             # Simple/flat images may legitimately be the same copy, but hashes alone
             # are unsafe. Require colour agreement + SSCD as additional evidence.
-            low_info_safe=bool(low_info and item["p"]>=98 and item["d"]>=95 and item["hist"]>=97 and item["copy_ai"]>=90)
+            low_info_safe=bool(low_info and item["p"]>=99 and item["d"]>=97 and item["hist"]>=98 and item["copy_ai"]>=94 and item["geometry"]>=70)
             strong=bool(strong_geometry or strong_hash or strong_combo or strong_copy or very_strong_copy or low_info_safe)
 
             score=max(item["base"],item["geometry"])
@@ -490,9 +575,9 @@ def check_image(path):
             # Alias learning is stricter than auto-collision. This prevents one bad
             # auto verdict from contaminating the customer's image cluster.
             learn_safe=bool(
-                strong_geometry
-                or strong_hash
-                or (not low_info and item["copy_ai"]>=86 and (item["geometry"]>=84 or item["p"]>=90 or item["orb"]>=75))
+                (strong_geometry and item["copy_ai"]>=72 and (item["ssim"]>=30 or item["p"]>=90))
+                or (not low_info and item["copy_ai"]>=90 and item["geometry"]>=82 and item["inliers"]>=12)
+                or (strong_hash and item["copy_ai"]>=80)
             )
             cur={**item,"score":score,"strong":strong,"learn_safe":learn_safe,"independent":independent}
             if best is None or cur["score"]>best["score"]:
@@ -514,7 +599,9 @@ def check_image(path):
                     "phash":round(best["p"],1),"dhash":round(best["d"],1),"orb":round(best["orb"],1),
                     "ai":round(best["ai"],1),"copy_ai":round(best["copy_ai"],1),"geometry":round(best["geometry"],1),
                     "inliers":best["inliers"],"method":best["geom_method"],"ssim":round(best.get("ssim",0.0),1),
-                    "overlap":round(best.get("overlap",0.0),3),"low_information":low_info,
+                    "overlap":round(best.get("overlap",0.0),3),"mutual":int(best.get("mutual",0)),
+                    "coverage_q":round(float(best.get("coverage_q",0.0)),4),"coverage_c":round(float(best.get("coverage_c",0.0)),4),
+                    "homography_sane":bool(best.get("homography_sane",False)),"low_information":low_info,
                     "blur":round(float(quality.get("lap_var") or 0.0),2),
                 },
             }
@@ -568,7 +655,7 @@ def save_customer_and_image(path,file_id,file_unique_id,submitter,submitter_id,c
         conn=get_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            exists=conn.execute("SELECT id,customer_id FROM images WHERE sha256=? OR md5=? LIMIT 1",(f["sha256"],f["md5"])).fetchone()
+            exists=conn.execute("SELECT id,customer_id FROM images WHERE COALESCE(trusted,1)=1 AND (sha256=? OR md5=?) LIMIT 1",(f["sha256"],f["md5"])).fetchone()
             if exists:
                 conn.rollback(); return exists["customer_id"],exists["id"],False
             cur=conn.execute("""INSERT INTO customers(name,age,job,income,work_year,software,receiver,raw_text,submitter,submitter_id,chat_id,source,source_message_id,created_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(customer_data.get("name",""),customer_data.get("age",""),customer_data.get("job",""),customer_data.get("income",""),customer_data.get("work_year",""),customer_data.get("software",""),customer_data.get("receiver",""),raw_text or "",submitter,submitter_id,chat_id,source,str(source_message_id or ""),now_iso()))
@@ -585,11 +672,15 @@ def save_image_alias(path,matched_image_id,file_id="",file_unique_id="",submitte
     conn=get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        exists=conn.execute("SELECT id,customer_id FROM images WHERE sha256=? OR md5=? LIMIT 1",(f["sha256"],f["md5"])).fetchone()
+        exists=conn.execute("SELECT id,customer_id FROM images WHERE COALESCE(trusted,1)=1 AND (sha256=? OR md5=?) LIMIT 1",(f["sha256"],f["md5"])).fetchone()
         if exists: conn.rollback(); return exists["customer_id"],exists["id"],False
-        base=conn.execute("SELECT customer_id FROM images WHERE id=?",(int(matched_image_id),)).fetchone()
+        base=conn.execute("SELECT customer_id FROM images WHERE id=? AND COALESCE(trusted,1)=1",(int(matched_image_id),)).fetchone()
         if not base or not base["customer_id"]: conn.rollback(); return None,None,False
         iid=_insert_image(conn,base["customer_id"],path,file_id,file_unique_id,submitter,submitter_id,chat_id,source,object_key,f)
+        conn.execute(
+            "UPDATE images SET trusted=1,parent_image_id=?,match_evidence=? WHERE id=?",
+            (int(matched_image_id), str(source or "alias"), int(iid)),
+        )
         conn.commit(); return base["customer_id"],iid,True
     except Exception:
         conn.rollback(); raise
@@ -759,3 +850,23 @@ def update_customer_fields(customer_id:int,fields:dict,submitter_id:str|None=Non
 
 def get_customer_by_id(customer_id:int):
     conn=get_conn(); row=conn.execute("SELECT * FROM customers WHERE id=?",(int(customer_id),)).fetchone(); conn.close(); return dict(row) if row else None
+
+
+def get_image_by_id(image_id: int):
+    """Return one stored image row plus a resolved local path for manual review."""
+    conn=get_conn()
+    try:
+        row=conn.execute(
+            """SELECT i.*, c.name AS customer_name
+               FROM images i LEFT JOIN customers c ON c.id=i.customer_id
+               WHERE i.id=? LIMIT 1""",
+            (int(image_id),),
+        ).fetchone()
+        if not row:
+            return None
+        data=dict(row)
+        rp=_stored_path(data.get("file_path"))
+        data["resolved_path"]=str(rp) if rp else ""
+        return data
+    finally:
+        conn.close()

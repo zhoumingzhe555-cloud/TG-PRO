@@ -85,3 +85,7 @@ OCR_FALLBACK = os.getenv("OCR_FALLBACK", "1").lower() not in {"0", "false", "no"
 OCR_LANGS = os.getenv("OCR_LANGS", "chi_tra+chi_sim+eng")
 IMPORT_ADMINS_ONLY = os.getenv("IMPORT_ADMINS_ONLY", "1").lower() not in {"0", "false", "no"}
 ADMIN_CHAT_ID: str = os.getenv("ADMIN_CHAT_ID", "").strip()
+
+# Show the historical image that actually matched the current query so staff can
+# visually audit the collision directly in Telegram.
+SHOW_MATCHED_IMAGE = os.getenv("SHOW_MATCHED_IMAGE", "1").lower() not in {"0", "false", "no"}

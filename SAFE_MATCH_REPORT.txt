@@ -1,0 +1,17 @@
+V1.9.1 SAFE-MATCH 修复说明
+
+重点修复：
+1. 非完全相同文件不再由 pHash/dHash 快速路径直接自动判定 90%+ 撞客。
+2. SIFT/AKAZE 改为双向 Lowe ratio + mutual match，减少木纹、栅栏、文字行、树叶等重复纹理误配。
+3. RANSAC 增加关键点空间覆盖率、Homography 合理性、重叠结构验证。
+4. 局部几何即使分数高，也必须获得 SSCD / pHash / ROI / SSIM 至少一种独立证据后才允许 AUTO90。
+5. SSCD 很高也不能单独越过 90%，需要结构/Hash/颜色至少一个独立支持。
+6. 自动学习 alias 比自动撞客更严格，防止一次误撞污染客户图片簇。
+7. 旧版本 source=auto_alias 且没有 parent_image_id 的自动学习图片会被“隔离”，不会参与识别；不会删除原数据。
+8. 新 alias 会记录 parent_image_id 和可信状态，便于后续审计。
+
+本地回归：
+- 用户提供的两张明显不同人物截图区域作为 hard-negative：局部几何仅 18 分，不会判撞客。
+- 同一照片大幅裁剪+JPEG压缩：98.84%，可判同图。
+- 同一照片左右镜像：90.52%，仍可识别。
+- Python compileall：通过。

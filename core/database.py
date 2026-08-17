@@ -122,7 +122,10 @@ def init_db() -> None:
             submitter_id TEXT,
             chat_id TEXT,
             source TEXT DEFAULT 'live',
-            created_time TEXT
+            created_time TEXT,
+            trusted INTEGER DEFAULT 1,
+            parent_image_id INTEGER,
+            match_evidence TEXT
         )
         """)
         _ensure_columns(conn, "images", {
@@ -133,8 +136,13 @@ def init_db() -> None:
             "ai_feature":"BLOB", "ai_hash":"TEXT",
             "a0":"TEXT", "a1":"TEXT", "a2":"TEXT", "a3":"TEXT", "a4":"TEXT", "a5":"TEXT", "a6":"TEXT", "a7":"TEXT",
             "customer_id":"INTEGER", "submitter":"TEXT", "submitter_id":"TEXT", "chat_id":"TEXT",
-            "source":"TEXT DEFAULT 'live'", "created_time":"TEXT",
+            "source":"TEXT DEFAULT 'live'", "created_time":"TEXT", "trusted":"INTEGER DEFAULT 1",
+            "parent_image_id":"INTEGER", "match_evidence":"TEXT",
         })
+        # V1.9.1 SAFE: old automatically learned aliases may have been created
+        # by permissive AUTO90 logic. Quarantine them instead of deleting data.
+        # New aliases created by V1.9.1 are explicitly re-trusted after strict verification.
+        conn.execute("UPDATE images SET trusted=0 WHERE source='auto_alias' AND COALESCE(parent_image_id,0)=0")
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS customers(
@@ -304,16 +312,22 @@ def init_db() -> None:
         )
         """)
 
+        # V1.9.3: 图片缓冲允许同一员工连续发送多张图片。旧版按 user_id 唯一会覆盖前一张，
+        # 导致稍后回复较早图片时重启后无法配对。迁移为 message_id 唯一。
+        conn.execute("DROP INDEX IF EXISTS idx_pending_buffer_key")
+
         index_sql = [
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256) WHERE sha256 IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_images_md5 ON images(md5)",
             "CREATE INDEX IF NOT EXISTS idx_images_customer ON images(customer_id)",
+            "CREATE INDEX IF NOT EXISTS idx_images_trusted ON images(trusted)",
             "CREATE INDEX IF NOT EXISTS idx_images_created ON images(created_time)",
             "CREATE INDEX IF NOT EXISTS idx_collision_status ON collision_records(status)",
             "CREATE INDEX IF NOT EXISTS idx_edit_log_customer ON customer_edit_log(customer_id)",
             "CREATE INDEX IF NOT EXISTS idx_edit_log_changed_time ON customer_edit_log(changed_time)",
             "CREATE INDEX IF NOT EXISTS idx_customers_created_time ON customers(created_time)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_buffer_key ON pending_buffer(buffer_type, chat_id, user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_pending_buffer_user ON pending_buffer(buffer_type, chat_id, user_id, ts)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_buffer_message ON pending_buffer(buffer_type, chat_id, message_id) WHERE message_id IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_crash_logs_created ON crash_logs(created_time)",
             "CREATE INDEX IF NOT EXISTS idx_sig_image ON image_signatures(image_id)",
             "CREATE INDEX IF NOT EXISTS idx_false_query ON false_positive_pairs(query_sha256)",
@@ -368,13 +382,24 @@ def save_pending_buffer(
     raw_text: str | None = None,
     info: dict | None = None,
 ) -> None:
-    info_json = json.dumps(info, ensure_ascii=False) if info is not None else None
+    info_json = json.dumps(
+        info, ensure_ascii=False,
+        default=lambda o: sorted(o) if isinstance(o, set) else str(o),
+    ) if info is not None else None
     conn = get_conn()
     try:
-        conn.execute(
-            "DELETE FROM pending_buffer WHERE buffer_type=? AND chat_id=? AND user_id=?",
-            (str(buffer_type), str(chat_id), str(user_id)),
-        )
+        # 文字资料只保留同一员工最新一份；图片则按 message_id 分别保留，
+        # 这样同一员工连续发多张图后，仍可通过回复某张旧图精确补资料。
+        if str(buffer_type) == "text" or message_id is None:
+            conn.execute(
+                "DELETE FROM pending_buffer WHERE buffer_type=? AND chat_id=? AND user_id=?",
+                (str(buffer_type), str(chat_id), str(user_id)),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM pending_buffer WHERE buffer_type=? AND chat_id=? AND message_id=?",
+                (str(buffer_type), str(chat_id), str(message_id)),
+            )
         conn.execute(
             """INSERT INTO pending_buffer
                (buffer_type,chat_id,user_id,ts,file_id,file_unique_id,file_path,obj_key,message_id,user_name,raw_text,info_json,created_time)
@@ -390,13 +415,19 @@ def save_pending_buffer(
         conn.close()
 
 
-def delete_pending_buffer(buffer_type: str, chat_id: str, user_id: str) -> None:
+def delete_pending_buffer(buffer_type: str, chat_id: str, user_id: str, message_id=None) -> None:
     conn = get_conn()
     try:
-        conn.execute(
-            "DELETE FROM pending_buffer WHERE buffer_type=? AND chat_id=? AND user_id=?",
-            (str(buffer_type), str(chat_id), str(user_id)),
-        )
+        if message_id is not None:
+            conn.execute(
+                "DELETE FROM pending_buffer WHERE buffer_type=? AND chat_id=? AND message_id=?",
+                (str(buffer_type), str(chat_id), str(message_id)),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM pending_buffer WHERE buffer_type=? AND chat_id=? AND user_id=?",
+                (str(buffer_type), str(chat_id), str(user_id)),
+            )
         conn.commit()
     finally:
         conn.close()

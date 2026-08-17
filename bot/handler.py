@@ -9,7 +9,7 @@ from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from config import IMAGE_DIR, IMPORT_DIR, OCR_FALLBACK, IMPORT_ADMINS_ONLY, IMAGE_CHECK_TIMEOUT, MAX_CONCURRENT_IMAGE_CHECKS, AUTO_COLLISION_THRESHOLD, MAX_IMAGE_BYTES
+from config import IMAGE_DIR, IMPORT_DIR, OCR_FALLBACK, IMPORT_ADMINS_ONLY, IMAGE_CHECK_TIMEOUT, MAX_CONCURRENT_IMAGE_CHECKS, AUTO_COLLISION_THRESHOLD, MAX_IMAGE_BYTES, SHOW_MATCHED_IMAGE
 from core.customer import parse_customer_info, is_customer_record, public_customer_data
 from core.database import get_conn, save_pending_buffer, delete_pending_buffer, load_pending_buffers, cleanup_expired_pending_buffers
 from core.object_storage import upload_image, image_object_key
@@ -25,6 +25,7 @@ from core.image_match import (
     get_collision,
     get_customer_by_id,
     update_customer_fields,
+    get_image_by_id,
 )
 
 log = logging.getLogger(__name__)
@@ -38,12 +39,15 @@ _pending: dict = {}
 # message-level index prevents customer data from being attached to the wrong image
 # when one staff member sends several photos quickly and replies to a specific one.
 _pending_by_message: dict = {}
-_PENDING_TTL = 3600  # 1 小时内发来的文字视为同一客户资料
+# 跨发送者精确回复绑定：只看 chat_id + 原图片 message_id。
+# 例如 A 发图片，B 回复该图片补客户资料，也必须能正确入库。
+_pending_by_chat_message: dict = {}
+_PENDING_TTL = 3600  # 图片等待客户资料：1 小时
 
 # 群聊中，有时先发文字资料再发图片。
 # key: (chat_id, user_id)  value: {"ts": float, "raw_text": str, "info": dict}
 _pending_text: dict = {}
-_PENDING_TEXT_TTL = 300  # 5 分钟内发来的图片视为同一客户
+_PENDING_TEXT_TTL = 3600  # 客户资料等待图片：1 小时
 
 # ── 字段元数据 ────────────────────────────────────────────────────────────────
 FIELD_LABELS: dict[str, str] = {
@@ -147,11 +151,11 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await msg.reply_text(text, parse_mode="Markdown")
         else:
-            # 群聊：保持原有撞客行为
-            text = "🔴 *撞客*\n\n匹配类型：同一图片\n相似度：100%"
+            # 群聊：同时把真正命中的历史图片发出来，便于人工核对。
+            text = "🔴 撞客\n\n匹配类型：同一图片\n相似度：100%"
             if matched and matched.get("name"):
-                text += f"\n已有客户：*{matched['name']}*"
-            await msg.reply_text(text, parse_mode="Markdown")
+                text += f"\n已有客户：{matched['name']}"
+            await _reply_match_result_with_history(msg, text, result["matched_image_id"])
         return
 
     # 相似图片：90% 及以上直接自动确认为撞客；低于 90% 才需要人工确认。
@@ -197,17 +201,17 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 log.info("AUTO90 已确认撞客，但证据未达到自动学习标准，未写入 alias")
             text = (
-                f"🔴 *撞客*\n\n"
+                f"🔴 撞客\n\n"
                 f"匹配类型：{result['match_type']}\n"
                 f"相似度：{score:.2f}%"
             )
             if matched and matched.get("name"):
-                text += f"\n已有客户：*{matched['name']}*"
+                text += f"\n已有客户：{matched['name']}"
                 extra = _format_customer_summary(matched)
                 if extra:
                     text += f"\n{extra}"
             text += f"\n\n✅ 已自动确认撞客（≥{AUTO_COLLISION_THRESHOLD:.0f}%）"
-            await msg.reply_text(text, parse_mode="Markdown")
+            await _reply_match_result_with_history(msg, text, result["matched_image_id"])
             return
 
         # 低于自动确认阈值的相似图片保留人工确认按钮。
@@ -216,27 +220,57 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ 误判", callback_data=f"collision:false_positive:{collision_id}"),
         ]])
         text = (
-            f"🟠 *疑似撞客*\n\n"
+            f"🟠 疑似撞客\n\n"
             f"匹配类型：{result['match_type']}\n"
             f"相似度：{score:.2f}%"
         )
         if matched and matched.get("name"):
-            text += f"\n已有客户：*{matched['name']}*"
+            text += f"\n已有客户：{matched['name']}"
             extra = _format_customer_summary(matched)
             if extra:
                 text += f"\n{extra}"
-        await msg.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+        # 人工确认按钮直接挂在历史命中图片上，审核者看到两张图后即可判断。
+        await _reply_match_result_with_history(msg, text, result["matched_image_id"], reply_markup=kb)
         return
 
     # ——— 新图：群聊专用快速流程 ———
-    # 优先使用 caption / 之前已暂存的文字资料；只有都没有时才考虑 OCR。
-    # 这样“先发资料再发图”的场景不会白跑一次 Tesseract。
+    # 图片“备注/说明文字”在 Telegram Bot API 中就是 caption。
+    # caption 是正式入库资料的最高优先级：图 + 可识别客户资料 = 直接进入正式入库流程。
+    # 同时支持多行备注，以及“姓名：... 年龄：... 职业：...”这种单行备注。
     raw_text = (msg.caption or "").strip()
     info = parse_customer_info(raw_text)
+    if is_customer_record(info):
+        log.info("[entry] 图片 caption/备注识别到正式客户资料 message_id=%s", msg.message_id)
 
     import time
     key = (str(chat.id), str(user.id))
     consumed_text_entry = None
+
+    # 图片可以直接“回复一条客户资料”发送。即使资料和图片不是同一个人发送，
+    # reply_to_message 也是最可靠的一对一关系，优先于任何时间邻近猜测。
+    if not is_customer_record(info) and msg.reply_to_message is not None:
+        replied_text = (msg.reply_to_message.text or msg.reply_to_message.caption or "").strip()
+        replied_info = parse_customer_info(replied_text)
+        if is_customer_record(replied_info):
+            raw_text = replied_text
+            info = replied_info
+            try:
+                replied_user = msg.reply_to_message.from_user
+                replied_uid = str(replied_user.id) if replied_user else None
+                if replied_uid:
+                    replied_key = (str(chat.id), replied_uid)
+                    pending_reply = _pending_text.get(replied_key)
+                    if pending_reply and str(pending_reply.get("message_id")) == str(msg.reply_to_message.message_id):
+                        _pending_text.pop(replied_key, None)
+                        try:
+                            await _run_sync(delete_pending_buffer, "text", str(chat.id), replied_uid)
+                        except Exception:
+                            log.warning("删除已通过回复绑定的文字缓冲失败", exc_info=True)
+                        if context.job_queue is not None:
+                            for _j in context.job_queue.get_jobs_by_name(f"pending_text_expire_{chat.id}_{replied_uid}"):
+                                _j.schedule_removal()
+            except Exception:
+                log.debug("清理回复绑定的文字缓冲失败（不影响入库）", exc_info=True)
 
     if not is_customer_record(info):
         text_entry = _pending_text.get(key)
@@ -303,10 +337,12 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "obj_key": None,
         "message_id": msg.message_id,
         "user_name": _user_name(user),
+        "owner_user_id": str(user.id),
         "features": result.get("features"),
     }
     _pending[key] = _entry
     _pending_by_message[(str(chat.id), str(user.id), str(msg.message_id))] = _entry
+    _pending_by_chat_message[(str(chat.id), str(msg.message_id))] = _entry
 
     _job_name = f"pending_expire_{chat.id}_{user.id}"
     if context.job_queue is not None:
@@ -350,8 +386,9 @@ async def _do_expire_pending(chat_id, user_id: str, gen: float, bot) -> None:
     mid = entry.get("message_id")
     if mid is not None:
         _pending_by_message.pop((str(chat_id), str(user_id), str(mid)), None)
+        _pending_by_chat_message.pop((str(chat_id), str(mid)), None)
     try:
-        await _run_sync(delete_pending_buffer, "image", str(chat_id), str(user_id))
+        await _run_sync(delete_pending_buffer, "image", str(chat_id), str(user_id), mid)
     except Exception:
         log.warning("删除图片缓冲DB记录失败", exc_info=True)
     # 未正式入库的查询图片只属于临时文件，过期后释放磁盘。
@@ -381,7 +418,7 @@ async def _do_expire_pending_text(chat_id, user_id: str, gen: float, bot) -> Non
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                f"⏰ {user_label}你之前发送的客户资料等待图片超过 5 分钟，已自动清除。\n"
+                f"⏰ {user_label}你之前发送的客户资料等待图片超过 1 小时，已自动清除。\n"
                 "如需入库，请重新发送客户资料和图片。"
             ),
             parse_mode="Markdown",
@@ -440,7 +477,7 @@ async def _save_group_customer(msg, file_id, file_unique_id, path, user, chat, i
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """监听群聊文字消息：若带客户资料且该用户最近发过图片，则补全入库。"""
+    """监听群聊客户资料：支持同消息、先图后文、先文后图，以及跨发送者“回复图片补资料”。"""
     import time
     msg = update.effective_message
     if not msg or not msg.text:
@@ -465,27 +502,61 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_mid = str(msg.reply_to_message.message_id)
     except Exception:
         reply_mid = None
-    entry = _pending_by_message.get((str(chat.id), str(user.id), reply_mid)) if reply_mid else None
+    entry = None
+    if reply_mid:
+        # 先允许“跨发送者回复绑定”：A 发图，B 回复该图发资料，也视为同一客户。
+        entry = _pending_by_chat_message.get((str(chat.id), reply_mid))
+        # 兼容旧内存索引。
+        if entry is None:
+            entry = _pending_by_message.get((str(chat.id), str(user.id), reply_mid))
     if entry is None:
+        # 没有明确回复关系时，只自动配对同一发送者最近的一张图片，避免多人群串客。
         entry = _pending.get(key)
 
     # 路径 A：已有缓冲图片（先图后文）→ 合并入库。回复某张图片时优先精确绑定 message_id。
     if entry:
         # 超时则通过集中式 helper 过期并通知（兜底路径，防止被动到来时静默丢失）
         if time.time() - entry["ts"] > _PENDING_TTL:
-            await _do_expire_pending(chat.id, user.id, entry["ts"], context.bot)
+            _expired_owner = str(entry.get("owner_user_id") or user.id)
+            _expired_mid = entry.get("message_id")
+            _expired_owner_key = (str(chat.id), _expired_owner)
+            if _pending.get(_expired_owner_key) is entry:
+                _pending.pop(_expired_owner_key, None)
+            if _expired_mid is not None:
+                _pending_by_chat_message.pop((str(chat.id), str(_expired_mid)), None)
+                for _k, _v in list(_pending_by_message.items()):
+                    if _v is entry:
+                        _pending_by_message.pop(_k, None)
+            try:
+                await _run_sync(delete_pending_buffer, "image", str(chat.id), _expired_owner, _expired_mid)
+            except Exception:
+                log.warning("删除过期图片缓冲失败", exc_info=True)
+            try:
+                _p = entry.get("path")
+                if _p and Path(_p).exists():
+                    Path(_p).unlink(missing_ok=True)
+            except Exception:
+                pass
         else:
-            # 先从内存移除，防止并发重入；DB 记录保留到入库成功后再删
-            _was_current = _pending.get(key) is entry
+            # 先从内存移除，防止并发重入；DB 记录保留到入库成功后再删。
+            # 跨发送者回复时，图片的 owner 不是当前资料发送者，必须按原图片发送者清理。
+            _owner_user_id = str(entry.get("owner_user_id") or user.id)
+            _owner_key = (str(chat.id), _owner_user_id)
+            _was_current = _pending.get(_owner_key) is entry
             if _was_current:
-                _pending.pop(key, None)
+                _pending.pop(_owner_key, None)
             mid = entry.get("message_id")
             if mid is not None:
-                _pending_by_message.pop((str(chat.id), str(user.id), str(mid)), None)
+                # entry 可能来自另一个发送者，跨发送者 map 必须按 chat+message 清理。
+                _pending_by_chat_message.pop((str(chat.id), str(mid)), None)
+                # 旧 map 的 user_id 可能不是当前资料发送者，因此按 identity 扫描删除。
+                for _k, _v in list(_pending_by_message.items()):
+                    if _v is entry:
+                        _pending_by_message.pop(_k, None)
             # 只有处理当前“最近一张”图片时才取消/删除其 DB 缓冲；
             # 回复更早图片时不能误伤后面刚发的新图片。
             if _was_current and context.job_queue is not None:
-                for _j in context.job_queue.get_jobs_by_name(f"pending_expire_{chat.id}_{user.id}"):
+                for _j in context.job_queue.get_jobs_by_name(f"pending_expire_{chat.id}_{_owner_user_id}"):
                     _j.schedule_removal()
             obj_key = entry["obj_key"]
             path = entry["path"]
@@ -500,9 +571,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     log.warning("无法重新下载缓冲图片，提示用户重新发送", exc_info=True)
                     # 重下失败：把内存条目还原，DB 记录不动，下次重启仍可恢复
-                    _pending[key] = entry
+                    _pending[_owner_key] = entry
                     if entry.get("message_id") is not None:
-                        _pending_by_message[(str(chat.id), str(user.id), str(entry["message_id"]))] = entry
+                        _pending_by_message[(str(chat.id), _owner_user_id, str(entry["message_id"]))] = entry
+                        _pending_by_chat_message[(str(chat.id), str(entry["message_id"]))] = entry
                     await msg.reply_text(
                         "⚠️ 之前缓存的图片在重启后丢失，请重新发送图片和客户资料。"
                     )
@@ -513,18 +585,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 features=entry.get("features"),
             )
             if saved:
-                # 只有当前最近图片才对应 pending_buffer 表里的那条记录。
-                if _was_current:
-                    try:
-                        delete_pending_buffer("image", str(chat.id), str(user.id))
-                    except Exception:
-                        log.warning("删除图片缓冲DB记录失败", exc_info=True)
+                # V1.9.3 图片缓冲按 message_id 持久化；无论是否为最近一张，都精确删除本次已入库图片。
+                try:
+                    await _run_sync(
+                        delete_pending_buffer, "image", str(chat.id), _owner_user_id, mid
+                    )
+                except Exception:
+                    log.warning("删除图片缓冲DB记录失败", exc_info=True)
             else:
                 # 入库失败：恢复原有索引；较早图片不会覆盖当前最近图片。
                 if _was_current:
-                    _pending[key] = entry
+                    _pending[_owner_key] = entry
                 if entry.get("message_id") is not None:
-                    _pending_by_message[(str(chat.id), str(user.id), str(entry["message_id"]))] = entry
+                    _pending_by_message[(str(chat.id), _owner_user_id, str(entry["message_id"]))] = entry
+                    _pending_by_chat_message[(str(chat.id), str(entry["message_id"]))] = entry
             return
 
     # 路径 B：没有缓冲图片（先文后图）→ 把资料文字暂存，等图片到来
@@ -560,7 +634,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await msg.reply_text(
         "📋 *客户资料已暂存*\n\n"
-        "请在 5 分钟内发送该客户的图片，即可自动完成入库。",
+        "请在 1 小时内发送该客户的图片，即可自动完成入库。",
         parse_mode="Markdown",
     )
 
@@ -961,6 +1035,45 @@ async def edit_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await msg.reply_text(f"❌ 更新失败，未找到客户 \\#{customer_id}", parse_mode="Markdown")
 
+async def _reply_match_result_with_history(msg, text: str, matched_image_id: int, reply_markup=None):
+    """Reply with the exact historical image that the matcher hit.
+
+    The current customer image is already the message being replied to, so sending
+    the historical hit as the reply gives staff an immediate visual A/B audit.
+    Falls back to a normal text reply if the old file is unavailable.
+    """
+    if not SHOW_MATCHED_IMAGE:
+        await msg.reply_text(text, reply_markup=reply_markup)
+        return False
+    try:
+        image = await _run_sync(get_image_by_id, int(matched_image_id))
+        rp = Path((image or {}).get("resolved_path") or "")
+        if not rp.is_file():
+            await msg.reply_text(text + "\n\n⚠️ 历史匹配图片文件暂不可读取", reply_markup=reply_markup)
+            return False
+        label = "📌 历史命中图片"
+        if image.get("customer_name"):
+            label += f"：{image['customer_name']}"
+        label += f"（图片ID {image.get('id')}）"
+        caption = f"{text}\n\n{label}\n↕️ 可直接与上方本次提交图片人工对比"
+        # Telegram photo captions are limited; keep the most useful portion.
+        if len(caption) > 1000:
+            caption = caption[:997] + "..."
+        try:
+            with rp.open("rb") as fh:
+                await msg.reply_photo(photo=fh, caption=caption, reply_markup=reply_markup)
+        except Exception:
+            # Some historical images may be too large/unusual for sendPhoto; send
+            # them as documents so review is still possible.
+            with rp.open("rb") as fh:
+                await msg.reply_document(document=fh, caption=caption, reply_markup=reply_markup)
+        return True
+    except Exception:
+        log.warning("发送历史匹配图片失败 image_id=%s", matched_image_id, exc_info=True)
+        await msg.reply_text(text + "\n\n⚠️ 历史匹配图片发送失败", reply_markup=reply_markup)
+        return False
+
+
 def _can_edit_customer(user_id: str, customer: dict) -> bool:
     """Return True only if this Telegram user submitted the customer record."""
     return str(customer.get("submitter_id", "")) == str(user_id)
@@ -1057,7 +1170,9 @@ async def restore_pending_buffers(bot, job_queue=None) -> None:
             if now - ts > _PENDING_TTL:
                 # 纯图片查询缓冲已过期：静默清理，不在群里追加提示。
                 try:
-                    await _run_sync(delete_pending_buffer, "image", chat_id, user_id)
+                    await _run_sync(
+                        delete_pending_buffer, "image", chat_id, user_id, entry.get("message_id")
+                    )
                 except Exception:
                     pass
                 try:
@@ -1080,11 +1195,13 @@ async def restore_pending_buffers(bot, job_queue=None) -> None:
                 "obj_key": entry.get("obj_key"),
                 "message_id": int(entry["message_id"]) if entry.get("message_id") else None,
                 "user_name": entry.get("user_name", ""),
+                "owner_user_id": str(user_id),
                 "features": None,
             }
             _pending[key] = _restored_entry
             if _restored_entry.get("message_id") is not None:
                 _pending_by_message[(str(chat_id), str(user_id), str(_restored_entry["message_id"]))] = _restored_entry
+                _pending_by_chat_message[(str(chat_id), str(_restored_entry["message_id"]))] = _restored_entry
             # 重新注册过期通知 Job，when = 剩余 TTL（至少 1 秒）
             if job_queue is not None:
                 _remaining = max(ts + _PENDING_TTL - now, 1)
@@ -1113,7 +1230,7 @@ async def restore_pending_buffers(bot, job_queue=None) -> None:
                     await bot.send_message(
                         chat_id=chat_id,
                         text=(
-                            f"⏰ {user_label}你之前发送的客户资料等待图片超过 5 分钟，已自动清除。\n"
+                            f"⏰ {user_label}你之前发送的客户资料等待图片超过 1 小时，已自动清除。\n"
                             "如需入库，请重新发送客户资料和图片。"
                         ),
                         parse_mode="Markdown",

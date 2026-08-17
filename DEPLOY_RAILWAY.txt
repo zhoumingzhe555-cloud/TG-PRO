@@ -1,4 +1,4 @@
-V1.9 GitHub + Railway 部署
+V1.9.1 GitHub + Railway 部署
 
 1. 解压 ZIP，把全部内容上传到 GitHub 仓库根目录。
 2. Railway 连接该 GitHub 仓库。
@@ -10,7 +10,7 @@ V1.9 GitHub + Railway 部署
 6. 部署。
 
 成功启动日志应包含：
-TG防撞客机器人 V1.9 SSCD-AI COPY-GUARD AUTO90 GitHub + Railway 启动
+TG防撞客机器人 V1.9.1 SAFE-MATCH SSCD-AI COPY-GUARD AUTO90 GitHub + Railway 启动
 SSCD 同图识别 AI 模型加载成功
 
 首次启动可能先下载约 99MB SSCD 模型，后续模型保存在 /data/models。

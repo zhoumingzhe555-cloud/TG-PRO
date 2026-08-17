@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 
 _HELP = """
-🤖 *TG防撞客机器人 V1.9 SSCD-AI*
+🤖 *TG防撞客机器人 V1.9.1 SAFE-MATCH SSCD-AI*
 
 ⚠️ *仅在群聊 / 超级群中工作，私聊模式已关闭。*
 
