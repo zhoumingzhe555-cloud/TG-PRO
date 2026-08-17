@@ -95,9 +95,11 @@ if __name__ == "__main__":
     try:
         init_db()
     except Exception as exc:
-        log.warning(
-            "数据库初始化失败（表结构已存在时可忽略此警告），Bot 继续启动：%s", exc
-        )
+        # 数据库是防撞客系统的核心状态。尤其在 Railway 上，如果 /data Volume
+        # 丢失，继续启动会让所有老客户看起来像“新客户”，因此必须失败关闭。
+        log.critical("数据库初始化失败，Bot 拒绝启动：%s", exc, exc_info=True)
+        _send_crash_alert(exc)
+        sys.exit(1)
     try:
         start()
     except (KeyboardInterrupt, SystemExit):

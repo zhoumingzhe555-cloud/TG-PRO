@@ -12,12 +12,13 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 
 from core.customer import parse_customer_info, is_customer_record, public_customer_data
-from core.image_match import save_customer_and_image, check_image
+from core.image_match import save_customer_and_image, save_image_alias, check_image, record_profile_conflict
+from core.database import get_conn
 from core.object_storage import upload_image, history_object_key
 
 log = logging.getLogger(__name__)
 
-IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".avif"}
 MANIFEST_NAME = "history_manifest.json"
 SELF_RECEIVER = {"自引", "自己", "本人", "self", "SELF"}
 
@@ -34,6 +35,8 @@ def _stats():
         "unresolved_profiles": 0,
         "query_photos": 0,
         "duplicates": 0,
+        "merged_variants": 0,
+        "profile_conflicts": 0,
     }
 
 
@@ -300,6 +303,30 @@ def analyze_html_export(paths: list[Path]):
     }
 
 
+def _matched_customer_by_image(image_id):
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT c.* FROM images i LEFT JOIN customers c ON c.id=i.customer_id WHERE i.id=? LIMIT 1",
+            (int(image_id),),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _profile_conflicts(existing: dict | None, incoming: dict | None):
+    if not existing or not incoming:
+        return {}
+    out = {}
+    for k in ("name", "age", "job", "income", "work_year", "software", "receiver"):
+        a = str(existing.get(k) or "").strip()
+        b = str(incoming.get(k) or "").strip()
+        if a and b and a != b:
+            out[k] = {"existing": a, "incoming": b}
+    return out
+
+
 def _import_candidate(candidate: dict, stats: dict):
     image = candidate.get("photo_path")
     if image is None or not Path(image).exists():
@@ -308,15 +335,50 @@ def _import_candidate(candidate: dict, stats: dict):
         return
     try:
         result = check_image(image)
+        incoming = candidate.get("customer_data") or {}
+
+        # Exact same file/photo never creates a second customer. If incoming formal
+        # data conflicts with the existing customer, record it for review instead
+        # of silently overwriting either side.
         if result["type"] == "same":
+            existing = _matched_customer_by_image(result["matched_image_id"])
+            conflicts = _profile_conflicts(existing, incoming)
+            if conflicts and existing:
+                record_profile_conflict(existing["id"], result["matched_image_id"], candidate.get("raw_text", ""), conflicts, "history")
+                stats["profile_conflicts"] += 1
             stats["duplicates"] += 1
             stats["skipped"] += 1
             return
+
+        # V1.9: only a strongly verified AND safe-to-learn variant belongs to
+        # the existing customer image cluster, not a brand-new customer.
+        if (
+            result["type"] == "similar"
+            and float(result.get("score") or 0) >= 90.0
+            and bool(result.get("strong_match"))
+            and bool(result.get("learn_safe"))
+        ):
+            existing = _matched_customer_by_image(result["matched_image_id"])
+            obj_key = _upload_image_safe(Path(image), result["features"]["sha256"])
+            save_image_alias(
+                Path(image), result["matched_image_id"], "", "",
+                candidate.get("sender", "history"), "", candidate.get("chat_id", "history"),
+                "history_alias", obj_key, result.get("features"),
+            )
+            conflicts = _profile_conflicts(existing, incoming)
+            if conflicts and existing:
+                record_profile_conflict(existing["id"], result["matched_image_id"], candidate.get("raw_text", ""), conflicts, "history")
+                stats["profile_conflicts"] += 1
+            stats["merged_variants"] += 1
+            stats["duplicates"] += 1
+            stats["skipped"] += 1
+            return
+
         obj_key = _upload_image_safe(Path(image), result["features"]["sha256"])
         save_customer_and_image(
             Path(image), "", "",
             candidate.get("sender", "history"), "", candidate.get("chat_id", "history"),
-            candidate.get("customer_data") or {}, candidate.get("raw_text", ""),
+            incoming, candidate.get("raw_text", ""),
             "history", candidate.get("profile_id", ""), obj_key,
             features=result.get("features"),
         )
@@ -324,7 +386,6 @@ def _import_candidate(candidate: dict, stats: dict):
     except Exception:
         log.exception("历史客户图片导入失败: %s", image)
         stats["skipped"] += 1
-
 
 def import_html_pages(paths: list[Path]):
     """导入 Telegram HTML：一张照片 = 一个客户。

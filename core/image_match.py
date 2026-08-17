@@ -1,355 +1,761 @@
+from __future__ import annotations
+
+import json
+import logging
+import threading
+from pathlib import Path
+
 import cv2
 import numpy as np
+
 from config import (
-    SIMILAR_THRESHOLD,
-    PHASH_DIRECT_THRESHOLD,
-    MAX_FALLBACK_CANDIDATES,
-    FAST_CANDIDATE_LIMIT,
-    DEEP_CANDIDATE_LIMIT,
+    SIMILAR_THRESHOLD, AUTO_COLLISION_THRESHOLD, PHASH_DIRECT_THRESHOLD,
+    FAST_CANDIDATE_LIMIT, DEEP_CANDIDATE_LIMIT, GEOMETRY_CANDIDATE_LIMIT,
+    FULL_LIGHT_SCAN_LIMIT, IMAGE_DIR, SSCD_TOP_K,
 )
 from core.database import get_conn, now_iso
 from core.image_features import (
-    extract_features,
-    extract_light_features,
-    enrich_deep_features,
-    hash_file_pair,
-    hamming_score,
-    pack_f32,
-    unpack_f32,
-    pack_orb,
-    unpack_orb,
+    extract_features, extract_light_features, enrich_deep_features, hash_file_pair,
+    hamming_score, pack_f32, unpack_f32, pack_orb, unpack_orb,
+    build_signatures, local_features, read_image, prepared_gray,
+    pack_local_feature, unpack_local_feature,
 )
+from core.object_storage import is_object_key, object_key_path
 from ai.embedding import cosine_score
+from core.copy_index import save_copy_features, load_copy_features, copy_candidate_scores, pack_copy_feature, unpack_copy_feature
+
+log = logging.getLogger(__name__)
+_SAVE_LOCK = threading.Lock()
 
 
 def _hist_score(a, b):
     if a is None or b is None:
         return 0.0
-    a = np.asarray(a, dtype=np.float32)
-    b = np.asarray(b, dtype=np.float32)
-    if not len(a) or not len(b):
-        return 0.0
+    a = np.asarray(a, dtype=np.float32); b = np.asarray(b, dtype=np.float32)
+    if not len(a) or not len(b): return 0.0
     corr = float(cv2.compareHist(a, b, cv2.HISTCMP_CORREL))
     return max(0.0, min(100.0, (corr + 1.0) * 50.0))
 
 
 def _orb_score(a, b):
-    if a is None or b is None or len(a) < 5 or len(b) < 5:
-        return 0.0
+    if a is None or b is None or len(a) < 5 or len(b) < 5: return 0.0
     try:
         bf = cv2.BFMatcher(cv2.NORM_HAMMING)
         pairs = bf.knnMatch(a, b, k=2)
-        good = 0
-        for pair in pairs:
-            if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance:
-                good += 1
+        good = sum(1 for p in pairs if len(p) == 2 and p[0].distance < 0.75 * p[1].distance)
         denom = max(12, min(len(a), len(b)))
-        return min(100.0, good / denom * 140.0)
+        return min(100.0, good / denom * 160.0)
     except Exception:
         return 0.0
 
 
-def _candidate_rows(conn, f):
-    """只取轻量字段。ORB/AI 大 BLOB 延迟到 Top-N 精确候选阶段再读。"""
-    clauses = []
-    params = []
-    for i, v in enumerate(f["p_bands"]):
-        if v:
-            clauses.append(f"p{i}=?")
-            params.append(v)
-
-    select = "id,phash,dhash,roi_phash,customer_id"
-    if clauses:
-        sql = (
-            f"SELECT {select} FROM images WHERE (" + " OR ".join(clauses) +
-            ") ORDER BY id DESC LIMIT ?"
-        )
-        rows = conn.execute(sql, params + [FAST_CANDIDATE_LIMIT]).fetchall()
-        if rows:
-            return rows
-
-    # 无 band 命中时只做有限回退，不再对几千张图全部跑 ORB。
-    return conn.execute(
-        f"SELECT {select} FROM images ORDER BY id DESC LIMIT ?",
-        (MAX_FALLBACK_CANDIDATES,),
-    ).fetchall()
-
-
-def _light_item(f, row):
-    p = hamming_score(f["phash"], row["phash"])
-    d = hamming_score(f["dhash"], row["dhash"])
-    roi = hamming_score(f["roi_phash"], row["roi_phash"])
-    # 轻量阶段不读取 color_hist/ORB/AI 大字段，减少远端 PostgreSQL 网络传输。
-    rank = 0.56 * p + 0.16 * d + 0.28 * roi
-    return {"row": row, "rank": rank, "p": p, "d": d, "roi": roi}
-
-
-def _fetch_deep_rows(conn, ids):
-    if not ids:
-        return {}
-    placeholders = ",".join(["?"] * len(ids))
-    rows = conn.execute(
-        f"SELECT id,color_hist,orb_desc,orb_rows,ai_feature FROM images WHERE id IN ({placeholders})",
-        ids,
-    ).fetchall()
-    return {int(r["id"]): r for r in rows}
-
-
-def check_image(path):
-    """
-    V1.5 Fast Path：
-      1) SHA256/MD5 先查数据库，完全同图不跑 OpenCV/AI；
-      2) pHash/dHash/ROI/色彩只做轻量候选排序；
-      3) 只对 Top-N 候选运行 ORB + AI。
-    """
-    sha256, md5 = hash_file_pair(path)
-    conn = get_conn()
+def _stored_path(file_path: str | None) -> Path | None:
+    if not file_path: return None
     try:
-        row = conn.execute(
-            "SELECT id FROM images WHERE sha256=? OR md5=? LIMIT 1",
-            (sha256, md5),
-        ).fetchone()
-        if row:
-            return {
-                "type": "same",
-                "score": 100.0,
-                "matched_image_id": row["id"],
-                "features": {"sha256": sha256, "md5": md5},
-                "match_type": "同一图片",
-            }
-
-        f, img = extract_light_features(path, sha256, md5)
-        light = [_light_item(f, row) for row in _candidate_rows(conn, f)]
-        light.sort(key=lambda x: x["rank"], reverse=True)
-
-        # pHash 近乎一致且 dHash/主体区域至少有一项也很高时，直接结束。
-        # 这是压缩、改尺寸、轻微重编码最常见的情况，不必跑 AI。
-        if light:
-            top = light[0]
-            if (
-                top["p"] >= PHASH_DIRECT_THRESHOLD
-                and max(top["d"], top["roi"]) >= 90.0
-            ):
-                score = min(
-                    99.5,
-                    max(
-                        90.0 + (top["p"] - PHASH_DIRECT_THRESHOLD) * 1.5,
-                        0.72 * top["p"] + 0.18 * top["roi"] + 0.10 * top["d"],
-                    ),
-                )
-                return {
-                    "type": "similar",
-                    "score": round(score, 2),
-                    "matched_image_id": top["row"]["id"],
-                    "features": f,
-                    "match_type": "相似图片",
-                    "detail": {
-                        "phash": round(top["p"], 1),
-                        "orb": 0.0,
-                        "ai": 0.0,
-                    },
-                }
-
-        # 只给最可能的少量候选做重计算。
-        top_candidates = light[:DEEP_CANDIDATE_LIMIT]
-        if not top_candidates:
-            # 没有历史图片时，新客户直接返回，连 ORB/AI 都不运行。
-            return {"type": "new", "score": 0.0, "features": f}
-
-        enrich_deep_features(f, img)
-        deep_map = _fetch_deep_rows(
-            conn, [int(item["row"]["id"]) for item in top_candidates]
-        )
-
-        best = None
-        for item in top_candidates:
-            row = item["row"]
-            deep = deep_map.get(int(row["id"]))
-            if deep is None:
-                orb = ai = 0.0
-            else:
-                orb = _orb_score(
-                    f["orb"], unpack_orb(deep["orb_desc"], deep["orb_rows"])
-                )
-                ai = cosine_score(f["ai_feature"], unpack_f32(deep["ai_feature"]))
-
-            p = item["p"]
-            d = item["d"]
-            roi = item["roi"]
-            hist = _hist_score(
-                f["color_hist"], unpack_f32(deep["color_hist"]) if deep is not None else None
-            )
-            score = 0.30 * p + 0.10 * d + 0.15 * roi + 0.10 * hist + 0.25 * orb + 0.10 * ai
-            if p >= PHASH_DIRECT_THRESHOLD:
-                score = max(score, 90.0 + (p - PHASH_DIRECT_THRESHOLD) * 1.5)
-            score = min(100.0, score)
-
-            current = {
-                "row": row,
-                "score": score,
-                "p": p,
-                "d": d,
-                "roi": roi,
-                "hist": hist,
-                "orb": orb,
-                "ai": ai,
-            }
-            if best is None or score > best["score"]:
-                best = current
-
-        if best and best["score"] >= SIMILAR_THRESHOLD:
-            match_type = (
-                "AI图片匹配"
-                if best["ai"] >= 88 and best["p"] < PHASH_DIRECT_THRESHOLD
-                else "相似图片"
-            )
-            return {
-                "type": "similar",
-                "score": round(best["score"], 2),
-                "matched_image_id": best["row"]["id"],
-                "features": f,
-                "match_type": match_type,
-                "detail": {
-                    "phash": round(best["p"], 1),
-                    "orb": round(best["orb"], 1),
-                    "ai": round(best["ai"], 1),
-                },
-            }
-        return {"type": "new", "score": 0.0, "features": f}
-    finally:
-        conn.close()
-
-
-def save_customer_and_image(path, file_id, file_unique_id, submitter, submitter_id, chat_id, customer_data, raw_text, source="live", source_message_id="", object_key=None, features=None):
-    """
-    Persist a customer + image record.
-
-    features: check_image() 已算过的完整特征可以直接复用，避免入库时再跑一遍
-              pHash/ORB/AI。历史导入或旧调用方不传时仍自动计算。
-    """
-    f = features or extract_features(path)
-    # 快速直返路径可能只有轻量特征；正式入库前补齐 ORB/AI。
-    if f.get("orb") is None or "ai_feature" not in f:
-        f = extract_features(path)
-
-    conn = get_conn()
-    try:
-        exists = conn.execute(
-            "SELECT id,customer_id FROM images WHERE sha256=? OR md5=? LIMIT 1",
-            (f["sha256"], f["md5"]),
-        ).fetchone()
-        if exists:
-            return exists["customer_id"], exists["id"], False
-
-        cur = conn.execute("""
-            INSERT INTO customers(name,age,job,income,work_year,software,receiver,raw_text,submitter,submitter_id,chat_id,source,source_message_id,created_time)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            customer_data.get("name", ""), customer_data.get("age", ""), customer_data.get("job", ""), customer_data.get("income", ""),
-            customer_data.get("work_year", ""), customer_data.get("software", ""), customer_data.get("receiver", ""), raw_text or "",
-            submitter, submitter_id, chat_id, source, str(source_message_id or ""), now_iso()
-        ))
-        customer_id = cur.lastrowid
-        orb_blob, orb_rows = pack_orb(f["orb"])
-        stored_path = object_key if object_key else str(path)
-        values = [
-            file_id, file_unique_id, stored_path, f["sha256"], f["md5"], f["phash"], f["dhash"], f["roi_phash"],
-            *f["p_bands"], pack_f32(f["color_hist"]), orb_blob, orb_rows, pack_f32(f["ai_feature"]), f["ai_hash"],
-            *f["a_bands"], customer_id, submitter, submitter_id, chat_id, source, now_iso()
-        ]
-        q = """
-        INSERT INTO images(file_id,file_unique_id,file_path,sha256,md5,phash,dhash,roi_phash,
-        p0,p1,p2,p3,p4,p5,p6,p7,color_hist,orb_desc,orb_rows,ai_feature,ai_hash,
-        a0,a1,a2,a3,a4,a5,a6,a7,customer_id,submitter,submitter_id,chat_id,source,created_time)
-        VALUES(""" + ",".join(["?"] * 35) + ")"
-        cur = conn.execute(q, values)
-        image_id = cur.lastrowid
-        conn.commit()
-        return customer_id, image_id, True
-    finally:
-        conn.close()
-
-
-def create_collision(query_sha256, matched_image_id, submitter, submitter_id, chat_id, match_type, score):
-    conn = get_conn()
-    cur = conn.execute("""
-        INSERT INTO collision_records(query_sha256,matched_image_id,query_submitter,query_submitter_id,chat_id,match_type,score,status,created_time)
-        VALUES(?,?,?,?,?,?,?,'pending',?)
-    """, (query_sha256, matched_image_id, submitter, submitter_id, chat_id, match_type, float(score), now_iso()))
-    cid = cur.lastrowid
-    conn.commit(); conn.close(); return cid
-
-
-def save_customer_only(submitter, submitter_id, chat_id, customer_data, raw_text, source="history", source_message_id=""):
-    """保存纯文字客户资料（没有关联图片）。用于历史导入时图片文件缺失的情况。"""
-    conn = get_conn()
-    cur = conn.execute("""
-        INSERT INTO customers(name,age,job,income,work_year,software,receiver,raw_text,submitter,submitter_id,chat_id,source,source_message_id,created_time)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        customer_data.get("name", ""), customer_data.get("age", ""), customer_data.get("job", ""),
-        customer_data.get("income", ""), customer_data.get("work_year", ""), customer_data.get("software", ""),
-        customer_data.get("receiver", ""), raw_text or "",
-        submitter, submitter_id, chat_id, source, str(source_message_id or ""), now_iso()
-    ))
-    customer_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return customer_id
-
-
-def update_customer_fields(customer_id: int, fields: dict, submitter_id: str | None = None, operator: str | None = None, operator_id: str | None = None) -> bool:
-    allowed = {"name", "age", "job", "income", "work_year", "software", "receiver"}
-    updates = {k: str(v).strip() for k, v in fields.items() if k in allowed}
-    if not updates:
-        return False
-    conn = get_conn()
-    try:
-        old_row = conn.execute("SELECT * FROM customers WHERE id=? LIMIT 1", (int(customer_id),)).fetchone()
-        old_data = dict(old_row) if old_row else {}
-        ts = now_iso()
-        op_name = operator or submitter_id or "unknown"
-        op_id = operator_id or submitter_id
-        set_parts = list(updates.keys()) + ["updated_time", "last_updated_by"]
-        set_clause = ", ".join(f"{k}=?" for k in set_parts)
-        update_values = list(updates.values()) + [ts, op_name]
-        if submitter_id is not None:
-            values = update_values + [int(customer_id), str(submitter_id)]
-            sql = f"UPDATE customers SET {set_clause} WHERE id=? AND submitter_id=?"
-        else:
-            values = update_values + [int(customer_id)]
-            sql = f"UPDATE customers SET {set_clause} WHERE id=?"
-        cur = conn.execute(sql, values)
-        if cur.rowcount > 0:
-            for field_name, new_val in updates.items():
-                old_val = str(old_data.get(field_name) or "")
-                conn.execute(
-                    "INSERT INTO customer_edit_log(customer_id, field_name, old_value, new_value, operator, operator_id, changed_time) VALUES(?,?,?,?,?,?,?)",
-                    (int(customer_id), field_name, old_val, new_val, op_name, op_id, ts),
-                )
-        conn.commit()
-        return cur.rowcount > 0
-    finally:
-        conn.close()
-
-
-def get_customer_by_id(customer_id: int) -> dict | None:
-    try:
-        conn = get_conn()
-        row = conn.execute("SELECT * FROM customers WHERE id=? LIMIT 1", (int(customer_id),)).fetchone()
-        conn.close()
-        return dict(row) if row else None
+        p = object_key_path(file_path) if is_object_key(file_path) else Path(file_path)
+        return p if p.exists() and p.is_file() else None
     except Exception:
         return None
 
 
-def confirm_collision(collision_id, status, confirmer, confirmer_id):
-    if status not in {"confirmed", "false_positive"}:
-        return False
-    conn = get_conn()
-    cur = conn.execute("""
-        UPDATE collision_records SET status=?,confirmer=?,confirmer_id=?,confirmed_time=?
-        WHERE id=? AND status='pending'
-    """, (status, confirmer, confirmer_id, now_iso(), collision_id))
-    changed = cur.rowcount > 0
-    conn.commit(); conn.close(); return changed
+def _save_signatures(conn, image_id: int, signatures):
+    for s in signatures or []:
+        bands = list(s.get("bands") or [""] * 8)[:8]
+        bands += [""] * (8 - len(bands))
+        conn.execute(
+            """INSERT INTO image_signatures(image_id,kind,phash,dhash,b0,b1,b2,b3,b4,b5,b6,b7,created_time)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(image_id,kind) DO UPDATE SET phash=excluded.phash,dhash=excluded.dhash,
+               b0=excluded.b0,b1=excluded.b1,b2=excluded.b2,b3=excluded.b3,b4=excluded.b4,b5=excluded.b5,b6=excluded.b6,b7=excluded.b7""",
+            (image_id, s.get("kind","full"), s.get("phash",""), s.get("dhash",""), *bands, now_iso()),
+        )
+
+
+def _signature_candidate_ids(conn, signatures):
+    clauses=[]; params=[]
+    for sig in signatures or []:
+        for i,v in enumerate(sig.get("bands") or []):
+            if v:
+                clauses.append(f"b{i}=?"); params.append(v)
+    if not clauses: return set()
+    sql = "SELECT DISTINCT image_id FROM image_signatures WHERE " + " OR ".join(clauses) + " LIMIT ?"
+    return {int(r[0]) for r in conn.execute(sql, params + [FAST_CANDIDATE_LIMIT]).fetchall()}
+
+
+def _legacy_band_candidate_ids(conn, f):
+    clauses=[]; params=[]
+    for i,v in enumerate(f.get("p_bands") or []):
+        if v:
+            clauses.append(f"p{i}=?"); params.append(v)
+    if not clauses: return set()
+    rows=conn.execute("SELECT id FROM images WHERE "+" OR ".join(clauses)+" LIMIT ?", params+[FAST_CANDIDATE_LIMIT]).fetchall()
+    return {int(r[0]) for r in rows}
+
+
+def _ai_candidate_ids(conn, f):
+    clauses=[]; params=[]
+    for i,v in enumerate(f.get("a_bands") or []):
+        if v:
+            clauses.append(f"a{i}=?"); params.append(v)
+    if not clauses: return set()
+    rows=conn.execute("SELECT id FROM images WHERE "+" OR ".join(clauses)+" LIMIT ?", params+[FAST_CANDIDATE_LIMIT]).fetchall()
+    return {int(r[0]) for r in rows}
+
+
+def _excluded_ids(conn, query_sha, query_phash):
+    rows=conn.execute("SELECT matched_image_id,query_phash FROM false_positive_pairs WHERE query_sha256=? OR query_phash=?", (query_sha, query_phash)).fetchall()
+    out=set()
+    for r in rows:
+        if r["query_phash"] == query_phash or hamming_score(query_phash, r["query_phash"]) >= 98.0:
+            out.add(int(r["matched_image_id"]))
+    return out
+
+
+def _quick_scores(f, rows, sig_map):
+    qs=f.get("signatures") or [{"phash":f.get("phash"),"dhash":f.get("dhash")}]
+    items=[]
+    for row in rows:
+        stored=sig_map.get(int(row["id"])) or [{"phash":row["phash"],"dhash":row["dhash"]}]
+        bestp=bestd=0.0
+        for q in qs:
+            for s in stored:
+                p=hamming_score(q.get("phash"),s.get("phash")); d=hamming_score(q.get("dhash"),s.get("dhash"))
+                if p+0.25*d > bestp+0.25*bestd: bestp,bestd=p,d
+        roi=hamming_score(f.get("roi_phash"), row["roi_phash"])
+        rank=0.62*bestp+0.18*bestd+0.20*roi
+        items.append({"row":row,"rank":rank,"p":bestp,"d":bestd,"roi":roi})
+    items.sort(key=lambda x:x["rank"], reverse=True)
+    return items
+
+
+def _load_signature_map(conn, ids):
+    if not ids: return {}
+    ph=','.join('?'*len(ids))
+    rows=conn.execute(f"SELECT image_id,kind,phash,dhash FROM image_signatures WHERE image_id IN ({ph})", list(ids)).fetchall()
+    out={}
+    for r in rows: out.setdefault(int(r["image_id"]),[]).append(dict(r))
+    return out
+
+
+def _full_light_rows(conn):
+    return conn.execute("SELECT id,phash,dhash,roi_phash,customer_id,ai_hash FROM images ORDER BY id DESC LIMIT ?", (FULL_LIGHT_SCAN_LIMIT,)).fetchall()
+
+
+def _fetch_deep(conn, ids):
+    if not ids: return {}
+    ph=','.join('?'*len(ids))
+    rows=conn.execute(f"SELECT id,file_path,customer_id,color_hist,orb_desc,orb_rows,ai_feature FROM images WHERE id IN ({ph})", ids).fetchall()
+    return {int(r["id"]):r for r in rows}
+
+
+def _match_descriptors(qf, cf, norm):
+    qd=qf.get("desc"); cd=cf.get("desc")
+    if qd is None or cd is None or len(qd)<4 or len(cd)<4: return {"score":0.0,"inliers":0,"ratio":0.0,"H":None}
+    try:
+        bf=cv2.BFMatcher(norm)
+        pairs=bf.knnMatch(qd,cd,k=2)
+        good=[p[0] for p in pairs if len(p)==2 and p[0].distance < 0.75*p[1].distance]
+        if len(good)<4: return {"score":min(65.0,len(good)*10.0),"inliers":0,"ratio":0.0,"H":None}
+        src=np.float32([qf["kp"][m.queryIdx] for m in good]).reshape(-1,1,2)
+        dst=np.float32([cf["kp"][m.trainIdx] for m in good]).reshape(-1,1,2)
+        H,mask=cv2.findHomography(src,dst,cv2.RANSAC,4.0)
+        inliers=int(mask.sum()) if mask is not None else 0
+        ratio=inliers/max(1,len(good))
+        # Strong local geometry quickly reaches 90+, but only with enough inliers.
+        if inliers>=18 and ratio>=0.45: score=min(99.4,92+min(7.4,(inliers-18)*0.25)+ratio*2)
+        elif inliers>=10 and ratio>=0.38: score=min(94.0,84+inliers*0.55+ratio*5)
+        elif inliers>=6 and ratio>=0.30: score=min(88.0,68+inliers*1.7+ratio*8)
+        else: score=min(78.0, len(good)*3.0+ratio*20)
+        return {"score":float(score),"inliers":inliers,"ratio":float(ratio),"H":H}
+    except Exception:
+        return {"score":0.0,"inliers":0,"ratio":0.0,"H":None}
+
+
+def _aligned_ssim(qgray, cgray, H):
+    if H is None:
+        return 0.0, 0.0
+    try:
+        h,w=cgray.shape[:2]
+        warped=cv2.warpPerspective(qgray,H,(w,h),flags=cv2.INTER_LINEAR)
+        mask=cv2.warpPerspective(np.ones(qgray.shape[:2],dtype=np.uint8)*255,H,(w,h),flags=cv2.INTER_NEAREST)>0
+        valid=mask & (warped>0)
+        count=int(valid.sum())
+        overlap=count/max(1,min(qgray.size,cgray.size))
+        if count<400 or overlap<0.05:
+            return 0.0,float(overlap)
+        x=warped[valid].astype(np.float32); y=cgray[valid].astype(np.float32)
+        ux=float(x.mean()); uy=float(y.mean())
+        vx=float(x.var()); vy=float(y.var()); cov=float(((x-ux)*(y-uy)).mean())
+        c1=(0.01*255)**2; c2=(0.03*255)**2
+        s=((2*ux*uy+c1)*(2*cov+c2))/((ux*ux+uy*uy+c1)*(vx+vy+c2)+1e-8)
+        return max(0.0,min(100.0,s*100.0)),float(overlap)
+    except Exception:
+        return 0.0,0.0
+
+
+def _geometry_once(query_img, cand_img, query_pre=None, candidate_local=None):
+    if query_pre is None:
+        qlocal=local_features(query_img); qg=prepared_gray(query_img)
+    else:
+        qlocal=query_pre["local"]; qg=query_pre["gray"]
+    clocal=candidate_local or local_features(cand_img)
+    sift=_match_descriptors(qlocal["sift"],clocal["sift"],cv2.NORM_L2)
+    ak=_match_descriptors(qlocal["akaze"],clocal["akaze"],cv2.NORM_HAMMING)
+    best=sift if sift["score"]>=ak["score"] else ak
+    best["method"]="SIFT" if best is sift else "AKAZE"
+    cg=prepared_gray(cand_img)
+    ssim,overlap=_aligned_ssim(qg,cg,best.get("H"))
+    best["ssim"]=ssim; best["overlap"]=min(1.0,overlap)
+    if best["inliers"]>=8 and best["ratio"]>=0.35 and overlap>=0.08:
+        best["score"]=max(best["score"], min(99.4, 0.72*best["score"]+0.28*ssim))
+    return best
+
+
+def _load_or_build_candidate_local(conn, image_id: int, cand_img):
+    """Persist candidate-side SIFT/AKAZE so repeated checks do not recompute them."""
+    try:
+        row=conn.execute("SELECT * FROM image_local_features WHERE image_id=?",(int(image_id),)).fetchone()
+        if row and row["sift_desc"] and row["akaze_desc"]:
+            return {
+                "sift": unpack_local_feature(row["sift_kp"],row["sift_desc"],row["sift_rows"],row["sift_cols"],row["sift_dtype"]),
+                "akaze": unpack_local_feature(row["akaze_kp"],row["akaze_desc"],row["akaze_rows"],row["akaze_cols"],row["akaze_dtype"]),
+            }
+    except Exception:
+        pass
+    local=local_features(cand_img)
+    try:
+        skp,sdesc,srows,scols,sdtype=pack_local_feature(local["sift"])
+        akp,akdesc,akrows,akcols,akdtype=pack_local_feature(local["akaze"])
+        conn.execute(
+            """INSERT INTO image_local_features(image_id,sift_kp,sift_desc,sift_rows,sift_cols,sift_dtype,akaze_kp,akaze_desc,akaze_rows,akaze_cols,akaze_dtype,updated_time)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(image_id) DO UPDATE SET
+                 sift_kp=excluded.sift_kp,sift_desc=excluded.sift_desc,sift_rows=excluded.sift_rows,sift_cols=excluded.sift_cols,sift_dtype=excluded.sift_dtype,
+                 akaze_kp=excluded.akaze_kp,akaze_desc=excluded.akaze_desc,akaze_rows=excluded.akaze_rows,akaze_cols=excluded.akaze_cols,akaze_dtype=excluded.akaze_dtype,updated_time=excluded.updated_time""",
+            (int(image_id),skp,sdesc,srows,scols,sdtype,akp,akdesc,akrows,akcols,akdtype,now_iso()),
+        )
+        conn.commit()
+    except Exception:
+        log.debug("缓存局部特征失败 image=%s",image_id,exc_info=True)
+    return local
+
+
+def _geometry_score(query_img, candidate_path: Path, qcache=None, conn=None, image_id=None):
+    try:
+        cand_img=read_image(candidate_path)
+        if qcache is None: qcache={}
+        if "normal" not in qcache:
+            qcache["normal"]={"local":local_features(query_img),"gray":prepared_gray(query_img)}
+        candidate_local=_load_or_build_candidate_local(conn,int(image_id),cand_img) if conn is not None and image_id is not None else local_features(cand_img)
+        normal=_geometry_once(query_img,cand_img,qcache["normal"],candidate_local)
+        if normal.get("score",0)>=90:
+            return normal
+        if "mirror_img" not in qcache:
+            qcache["mirror_img"]=cv2.flip(query_img,1)
+            qcache["mirror"]={"local":local_features(qcache["mirror_img"]),"gray":prepared_gray(qcache["mirror_img"])}
+        mirrored=_geometry_once(qcache["mirror_img"],cand_img,qcache["mirror"],candidate_local)
+        if mirrored.get("score",0)>normal.get("score",0):
+            mirrored["method"]=(mirrored.get("method") or "")+"+MIRROR"
+            return mirrored
+        return normal
+    except Exception:
+        return {"score":0.0,"inliers":0,"ratio":0.0,"H":None,"method":"","ssim":0.0,"overlap":0.0}
+
+def _fetch_light_rows_by_ids(conn, ids):
+    ids=list({int(x) for x in ids if x is not None})
+    if not ids: return []
+    out=[]
+    for st in range(0,len(ids),700):
+        chunk=ids[st:st+700]
+        ph=','.join('?'*len(chunk))
+        out.extend(conn.execute(
+            f"SELECT id,phash,dhash,roi_phash,customer_id,ai_hash FROM images WHERE id IN ({ph})",
+            chunk,
+        ).fetchall())
+    return out
+
+
+def _first_copy_feature(features):
+    for item in features.get("copy_views") or []:
+        try:
+            v=np.asarray(item.get("feature"),dtype=np.float32).reshape(-1)
+            if v.size:
+                n=float(np.linalg.norm(v))
+                return v/n if n>1e-8 else v
+        except Exception:
+            pass
+    return None
+
+
+def _false_positive_exclusions(conn, query_sha, query_phash, query_copy_vec):
+    """Return image/customer exclusions, including transformed variants of a prior false positive."""
+    rows=conn.execute(
+        """SELECT fp.*, COALESCE(fp.matched_customer_id,i.customer_id) AS cid
+           FROM false_positive_pairs fp LEFT JOIN images i ON i.id=fp.matched_image_id"""
+    ).fetchall()
+    image_ids=set(); customer_ids=set()
+    for r in rows:
+        same=False
+        if r["query_sha256"] and r["query_sha256"]==query_sha:
+            same=True
+        elif query_phash and r["query_phash"] and hamming_score(query_phash,r["query_phash"])>=96.0:
+            same=True
+        elif query_copy_vec is not None and r["query_copy_feature"] and r["query_copy_dim"]:
+            old=unpack_copy_feature(r["query_copy_feature"],r["query_copy_dim"])
+            if old is not None and old.size==query_copy_vec.size:
+                sim=float(np.dot(old,query_copy_vec)/(max(1e-8,np.linalg.norm(old))*max(1e-8,np.linalg.norm(query_copy_vec))))*100.0
+                if sim>=96.0:
+                    same=True
+        if same:
+            image_ids.add(int(r["matched_image_id"]))
+            if r["cid"]:
+                customer_ids.add(int(r["cid"]))
+    return image_ids,customer_ids
+
+
+def _ensure_candidate_copy_score(conn, query_views, image_id, candidate_path, existing_score=0.0):
+    """Build missing SSCD descriptors lazily for old V1.8 images and return exact max cosine."""
+    if not query_views or existing_score>0:
+        return float(existing_score)
+    try:
+        stored=load_copy_features(conn,{int(image_id)}).get(int(image_id),[])
+        if not stored and candidate_path:
+            from ai.copy_embedding import extract_copy_features
+            img=read_image(candidate_path)
+            stored=extract_copy_features(img)
+            if stored:
+                save_copy_features(conn,int(image_id),stored)
+                conn.commit()
+        if not stored:
+            return 0.0
+        from ai.copy_embedding import max_cosine
+        score,_,_=max_cosine(query_views,stored)
+        return float(score)
+    except Exception:
+        log.debug("候选SSCD特征补建失败 image=%s",image_id,exc_info=True)
+        return float(existing_score)
+
+
+def check_image(path):
+    """V1.9: exact hash -> safe light recall -> SSCD copy-AI recall -> geometry verification."""
+    sha256,md5=hash_file_pair(path)
+    conn=get_conn()
+    try:
+        row=conn.execute("SELECT id FROM images WHERE sha256=? OR md5=? LIMIT 1",(sha256,md5)).fetchone()
+        if row:
+            return {
+                "type":"same","score":100.0,"matched_image_id":row["id"],
+                "features":{"sha256":sha256,"md5":md5},"match_type":"同一图片",
+                "strong_match":True,"learn_safe":False,
+            }
+
+        f,img=extract_light_features(path,sha256,md5)
+        quality=f.get("quality") or {}
+        low_info=bool(quality.get("low_information"))
+
+        candidate_ids=_signature_candidate_ids(conn,f["signatures"]) | _legacy_band_candidate_ids(conn,f)
+        all_rows=_full_light_rows(conn)
+        indexed_rows=[r for r in all_rows if int(r["id"]) in candidate_ids]
+        indexed_scores=_quick_scores(
+            f,indexed_rows,_load_signature_map(conn,{int(r["id"]) for r in indexed_rows})
+        ) if indexed_rows else []
+        full_scores=_quick_scores(f,all_rows,{})[:FAST_CANDIDATE_LIMIT]
+        merged={}
+        for item in indexed_scores+full_scores:
+            iid=int(item["row"]["id"])
+            if iid not in merged or item["rank"]>merged[iid]["rank"]:
+                merged[iid]=item
+        light=sorted(merged.values(),key=lambda x:x["rank"],reverse=True)
+
+        # Respect prior human false-positive decisions even on the fast hash path.
+        pre_ex_images,pre_ex_customers=_false_positive_exclusions(conn,sha256,f.get("phash"),None)
+        light=[x for x in light if int(x["row"]["id"]) not in pre_ex_images and (not x["row"]["customer_id"] or int(x["row"]["customer_id"]) not in pre_ex_customers)]
+
+        # pHash can collide badly on flat/simple images. V1.9 never auto-verdicts
+        # low-information images from hash alone.
+        if light and not low_info:
+            top=light[0]
+            if top["p"]>=PHASH_DIRECT_THRESHOLD and max(top["d"],top["roi"])>=90:
+                score=min(99.5,max(90.0+(top["p"]-PHASH_DIRECT_THRESHOLD)*1.5,0.74*top["p"]+0.16*top["d"]+0.10*top["roi"]))
+                return {
+                    "type":"similar","score":round(score,2),"matched_image_id":top["row"]["id"],
+                    "features":f,"match_type":"高度相似图片","strong_match":True,
+                    "learn_safe":True,
+                    "detail":{"phash":round(top["p"],1),"dhash":round(top["d"],1),"geometry":0.0,"orb":0.0,"ai":0.0,"copy_ai":0.0},
+                }
+
+        # Deep features now include both legacy MobileNet auxiliary features and
+        # task-specific SSCD copy descriptors. SSCD is an independent candidate
+        # recall path, so crop/screenshot changes do not need to survive pHash first.
+        enrich_deep_features(f,img)
+        copy_ranked=copy_candidate_scores(conn,f.get("copy_views") or [],SSCD_TOP_K)
+        copy_score_map={int(x["image_id"]):float(x["score"]) for x in copy_ranked}
+        copy_ids=set(copy_score_map)
+
+        ai_ids=_ai_candidate_ids(conn,f)
+        have={int(x["row"]["id"]) for x in light}
+        extra_ids=(copy_ids | ai_ids) - have
+        if extra_ids:
+            add_rows=_fetch_light_rows_by_ids(conn,extra_ids)
+            if add_rows:
+                add_scores=_quick_scores(f,add_rows,_load_signature_map(conn,{int(r["id"]) for r in add_rows}))
+                light.extend(add_scores)
+
+        # Cluster-level false-positive memory. A re-crop of a previously rejected
+        # pair excludes every alias belonging to that matched customer.
+        query_copy=_first_copy_feature(f)
+        excluded_images,excluded_customers=_false_positive_exclusions(conn,sha256,f.get("phash"),query_copy)
+        light=[x for x in light if int(x["row"]["id"]) not in excluded_images and (not x["row"]["customer_id"] or int(x["row"]["customer_id"]) not in excluded_customers)]
+        light.sort(key=lambda x:max(x["rank"],copy_score_map.get(int(x["row"]["id"]),0.0)),reverse=True)
+
+        top_candidates=light[:DEEP_CANDIDATE_LIMIT]
+        if not top_candidates:
+            return {"type":"new","score":0.0,"features":f}
+
+        deep_map=_fetch_deep(conn,[int(x["row"]["id"]) for x in top_candidates])
+        evaluated=[]
+        for item in top_candidates:
+            iid=int(item["row"]["id"])
+            deep=deep_map.get(iid)
+            if not deep: continue
+            orb=_orb_score(f.get("orb"),unpack_orb(deep["orb_desc"],deep["orb_rows"]))
+            ai=cosine_score(f.get("ai_feature"),unpack_f32(deep["ai_feature"]))
+            hist=_hist_score(f.get("color_hist"),unpack_f32(deep["color_hist"]))
+            copy_ai=copy_score_map.get(iid,0.0)
+            base=0.24*item["p"]+0.08*item["d"]+0.10*item["roi"]+0.07*hist+0.15*orb+0.06*ai+0.30*copy_ai
+            evaluated.append({
+                **item,"deep":deep,"orb":orb,"ai":ai,"copy_ai":copy_ai,"hist":hist,
+                "base":base,"geometry":0.0,"inliers":0,"geom_ratio":0.0,"geom_method":"",
+                "ssim":0.0,"overlap":0.0,
+            })
+        evaluated.sort(key=lambda x:max(x["base"],x["rank"],x["copy_ai"]),reverse=True)
+
+        # Pairwise verification. Candidate local descriptors are cached in SQLite,
+        # so repeated checks become cheaper instead of recomputing SIFT/AKAZE.
+        _qgeom_cache={}
+        for item in evaluated[:GEOMETRY_CANDIDATE_LIMIT]:
+            iid=int(item["row"]["id"])
+            cp=_stored_path(item["deep"]["file_path"])
+            if cp:
+                if item["copy_ai"]<=0 and f.get("copy_views"):
+                    item["copy_ai"]=_ensure_candidate_copy_score(conn,f.get("copy_views"),iid,cp,item["copy_ai"])
+                g=_geometry_score(img,cp,_qgeom_cache,conn=conn,image_id=iid)
+                item["geometry"]=g["score"]; item["inliers"]=g["inliers"]; item["geom_ratio"]=g["ratio"]
+                item["geom_method"]=g.get("method",""); item["ssim"]=g.get("ssim",0.0); item["overlap"]=g.get("overlap",0.0)
+
+        best=None
+        for item in evaluated:
+            independent=sum([
+                item["p"]>=92, item["d"]>=90, item["roi"]>=90,
+                item["orb"]>=75, item["geometry"]>=84, item["copy_ai"]>=82,
+            ])
+            strong_geometry=item["geometry"]>=90 and item["inliers"]>=10
+            strong_hash=(not low_info and item["p"]>=PHASH_DIRECT_THRESHOLD and max(item["d"],item["roi"])>=90)
+            strong_combo=(not low_info and item["p"]>=90 and item["orb"]>=70 and independent>=2)
+            # SSCD is trained for copy detection. We still demand either very high
+            # SSCD similarity or one independent structural corroborator to guard
+            # against hard-negative/look-alike images.
+            strong_copy=(not low_info and item["copy_ai"]>=82 and (
+                item["geometry"]>=76 or item["p"]>=84 or item["roi"]>=84 or item["orb"]>=62
+            ))
+            very_strong_copy=(not low_info and item["copy_ai"]>=91)
+            # Simple/flat images may legitimately be the same copy, but hashes alone
+            # are unsafe. Require colour agreement + SSCD as additional evidence.
+            low_info_safe=bool(low_info and item["p"]>=98 and item["d"]>=95 and item["hist"]>=97 and item["copy_ai"]>=90)
+            strong=bool(strong_geometry or strong_hash or strong_combo or strong_copy or very_strong_copy or low_info_safe)
+
+            score=max(item["base"],item["geometry"])
+            if strong_geometry:
+                score=max(score,item["geometry"])
+            if strong_hash:
+                score=max(score,90+(item["p"]-PHASH_DIRECT_THRESHOLD)*1.5)
+            if strong_copy:
+                score=max(score,90+min(9.3,max(0.0,item["copy_ai"]-82)*0.62+max(0.0,item["geometry"]-76)*0.08))
+            elif very_strong_copy:
+                score=max(score,92+min(7.0,(item["copy_ai"]-91)*0.75))
+            elif item["copy_ai"]>=70:
+                # Useful for candidate ranking/suspect alerts, but never auto-cross 90.
+                score=max(score,min(AUTO_COLLISION_THRESHOLD-0.25,82+(item["copy_ai"]-70)*0.48))
+            if low_info_safe:
+                score=max(score,92+min(5.0,(item["hist"]-97)*0.6+(item["copy_ai"]-90)*0.25))
+
+            if low_info and not (strong_geometry or low_info_safe):
+                # Flat/simple/default-avatar images require manual confirmation unless
+                # exact file hash or real local geometry proves they are the same copy.
+                strong=False
+            if not strong:
+                score=min(score,AUTO_COLLISION_THRESHOLD-0.25)
+            score=min(99.6,max(0.0,score))
+
+            # Alias learning is stricter than auto-collision. This prevents one bad
+            # auto verdict from contaminating the customer's image cluster.
+            learn_safe=bool(
+                strong_geometry
+                or strong_hash
+                or (not low_info and item["copy_ai"]>=86 and (item["geometry"]>=84 or item["p"]>=90 or item["orb"]>=75))
+            )
+            cur={**item,"score":score,"strong":strong,"learn_safe":learn_safe,"independent":independent}
+            if best is None or cur["score"]>best["score"]:
+                best=cur
+
+        if best and best["score"]>=SIMILAR_THRESHOLD:
+            if best["copy_ai"]>=82 and best["copy_ai"]>=max(best["geometry"],best["p"]):
+                mtype="AI同图识别"
+            elif best["geometry"]>=84:
+                mtype="局部同图匹配"
+            elif best["p"]>=92:
+                mtype="高度相似图片"
+            else:
+                mtype="视觉相似图片"
+            return {
+                "type":"similar","score":round(best["score"],2),"matched_image_id":best["row"]["id"],
+                "features":f,"match_type":mtype,"strong_match":best["strong"],"learn_safe":best["learn_safe"],
+                "detail":{
+                    "phash":round(best["p"],1),"dhash":round(best["d"],1),"orb":round(best["orb"],1),
+                    "ai":round(best["ai"],1),"copy_ai":round(best["copy_ai"],1),"geometry":round(best["geometry"],1),
+                    "inliers":best["inliers"],"method":best["geom_method"],"ssim":round(best.get("ssim",0.0),1),
+                    "overlap":round(best.get("overlap",0.0),3),"low_information":low_info,
+                    "blur":round(float(quality.get("lap_var") or 0.0),2),
+                },
+            }
+        return {"type":"new","score":0.0,"features":f}
+    finally:
+        conn.close()
+
+
+def _insert_image(conn, customer_id, path, file_id, file_unique_id, submitter, submitter_id, chat_id, source, object_key, f):
+    orb_blob,orb_rows=pack_orb(f.get("orb"))
+    stored_path=object_key if object_key else str(path)
+    vals=[file_id,file_unique_id,stored_path,f["sha256"],f["md5"],f["phash"],f["dhash"],f["roi_phash"],*f["p_bands"],pack_f32(f["color_hist"]),orb_blob,orb_rows,pack_f32(f.get("ai_feature")),f.get("ai_hash",""),*f.get("a_bands",[""]*8),customer_id,submitter,submitter_id,chat_id,source,now_iso()]
+    q="""INSERT INTO images(file_id,file_unique_id,file_path,sha256,md5,phash,dhash,roi_phash,p0,p1,p2,p3,p4,p5,p6,p7,color_hist,orb_desc,orb_rows,ai_feature,ai_hash,a0,a1,a2,a3,a4,a5,a6,a7,customer_id,submitter,submitter_id,chat_id,source,created_time) VALUES("""+",".join(["?"]*35)+")"
+    cur=conn.execute(q,vals); image_id=cur.lastrowid
+    _save_signatures(conn,image_id,f.get("signatures"))
+    try:
+        save_copy_features(conn,image_id,f.get("copy_views"))
+    except Exception:
+        log.debug("保存SSCD同图特征失败 image=%s",image_id,exc_info=True)
+    if f.get("local"):
+        try:
+            skp,sdesc,srows,scols,sdtype=pack_local_feature(f["local"]["sift"])
+            akp,akdesc,akrows,akcols,akdtype=pack_local_feature(f["local"]["akaze"])
+            conn.execute(
+                """INSERT OR REPLACE INTO image_local_features(image_id,sift_kp,sift_desc,sift_rows,sift_cols,sift_dtype,akaze_kp,akaze_desc,akaze_rows,akaze_cols,akaze_dtype,updated_time)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (image_id,skp,sdesc,srows,scols,sdtype,akp,akdesc,akrows,akcols,akdtype,now_iso()),
+            )
+        except Exception:
+            log.debug("保存局部特征失败 image=%s",image_id,exc_info=True)
+    return image_id
+
+
+def save_customer_and_image(path,file_id,file_unique_id,submitter,submitter_id,chat_id,customer_data,raw_text,source="live",source_message_id="",object_key=None,features=None):
+    # Serialize formal customer creation. This closes the race where two staff
+    # submit the same new photo at nearly the same time and both saw "new".
+    with _SAVE_LOCK:
+        # Handler has already run the full detector and passes its features.
+        # Re-running SSCD/SIFT here would double latency. Only callers that did
+        # not provide prechecked features need a second full duplicate check.
+        if source == "live" and features is None:
+            latest = check_image(path)
+            if latest.get("type") == "same":
+                conn=get_conn(); row=conn.execute("SELECT id,customer_id FROM images WHERE id=?",(latest["matched_image_id"],)).fetchone(); conn.close()
+                if row: return row["customer_id"],row["id"],False
+            if latest.get("type") == "similar" and latest.get("strong_match") and float(latest.get("score") or 0)>=AUTO_COLLISION_THRESHOLD:
+                return save_image_alias(path,latest["matched_image_id"],file_id,file_unique_id,submitter,submitter_id,chat_id,"live_alias",object_key,latest.get("features"))
+
+        f=features or extract_features(path)
+        if f.get("orb") is None or (not f.get("copy_views") and f.get("ai_feature") is None): f=extract_features(path)
+        conn=get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            exists=conn.execute("SELECT id,customer_id FROM images WHERE sha256=? OR md5=? LIMIT 1",(f["sha256"],f["md5"])).fetchone()
+            if exists:
+                conn.rollback(); return exists["customer_id"],exists["id"],False
+            cur=conn.execute("""INSERT INTO customers(name,age,job,income,work_year,software,receiver,raw_text,submitter,submitter_id,chat_id,source,source_message_id,created_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(customer_data.get("name",""),customer_data.get("age",""),customer_data.get("job",""),customer_data.get("income",""),customer_data.get("work_year",""),customer_data.get("software",""),customer_data.get("receiver",""),raw_text or "",submitter,submitter_id,chat_id,source,str(source_message_id or ""),now_iso()))
+            cid=cur.lastrowid
+            iid=_insert_image(conn,cid,path,file_id,file_unique_id,submitter,submitter_id,chat_id,source,object_key,f)
+            conn.commit(); return cid,iid,True
+        except Exception:
+            conn.rollback(); raise
+        finally: conn.close()
+
+def save_image_alias(path,matched_image_id,file_id="",file_unique_id="",submitter="",submitter_id="",chat_id="",source="alias",object_key=None,features=None):
+    f=features or extract_features(path)
+    if f.get("orb") is None or (not f.get("copy_views") and f.get("ai_feature") is None): f=extract_features(path)
+    conn=get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        exists=conn.execute("SELECT id,customer_id FROM images WHERE sha256=? OR md5=? LIMIT 1",(f["sha256"],f["md5"])).fetchone()
+        if exists: conn.rollback(); return exists["customer_id"],exists["id"],False
+        base=conn.execute("SELECT customer_id FROM images WHERE id=?",(int(matched_image_id),)).fetchone()
+        if not base or not base["customer_id"]: conn.rollback(); return None,None,False
+        iid=_insert_image(conn,base["customer_id"],path,file_id,file_unique_id,submitter,submitter_id,chat_id,source,object_key,f)
+        conn.commit(); return base["customer_id"],iid,True
+    except Exception:
+        conn.rollback(); raise
+    finally: conn.close()
+
+
+def create_collision(query_sha256,matched_image_id,submitter,submitter_id,chat_id,match_type,score,query_phash="",query_file_path="",query_file_id="",query_file_unique_id="",query_copy_feature=None):
+    blob,dim=pack_copy_feature(query_copy_feature)
+    conn=get_conn()
+    try:
+        cur=conn.execute(
+            """INSERT INTO collision_records(query_sha256,query_phash,query_file_path,query_file_id,query_file_unique_id,query_copy_feature,query_copy_dim,matched_image_id,query_submitter,query_submitter_id,chat_id,match_type,score,status,created_time)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)""",
+            (query_sha256,query_phash,query_file_path,query_file_id,query_file_unique_id,blob,dim,matched_image_id,submitter,submitter_id,chat_id,match_type,float(score),now_iso()),
+        )
+        cid=cur.lastrowid
+        conn.commit()
+        return cid
+    finally:
+        conn.close()
+
+
+def get_collision(collision_id):
+    conn=get_conn(); row=conn.execute("SELECT * FROM collision_records WHERE id=?",(int(collision_id),)).fetchone(); conn.close(); return dict(row) if row else None
+
+
+def confirm_collision(collision_id,status,confirmer,confirmer_id):
+    if status not in {"confirmed","false_positive"}: return False
+    conn=get_conn()
+    try:
+        row=conn.execute("SELECT * FROM collision_records WHERE id=?",(int(collision_id),)).fetchone()
+        if not row: return False
+        cur=conn.execute("UPDATE collision_records SET status=?,confirmer=?,confirmer_id=?,confirmed_time=? WHERE id=? AND status='pending'",(status,confirmer,confirmer_id,now_iso(),collision_id))
+        changed=cur.rowcount>0
+        if changed and status=="false_positive":
+            im=conn.execute("SELECT customer_id FROM images WHERE id=?",(row["matched_image_id"],)).fetchone()
+            cid=im["customer_id"] if im else None
+            conn.execute(
+                """INSERT INTO false_positive_pairs(query_sha256,query_phash,matched_image_id,matched_customer_id,query_copy_feature,query_copy_dim,confirmer_id,created_time)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(query_sha256,matched_image_id) DO UPDATE SET
+                     query_phash=excluded.query_phash,matched_customer_id=excluded.matched_customer_id,
+                     query_copy_feature=excluded.query_copy_feature,query_copy_dim=excluded.query_copy_dim,
+                     confirmer_id=excluded.confirmer_id,created_time=excluded.created_time""",
+                (row["query_sha256"],row["query_phash"],row["matched_image_id"],cid,row["query_copy_feature"],row["query_copy_dim"],confirmer_id,now_iso()),
+            )
+        conn.commit(); return changed
+    finally: conn.close()
+
+
+def record_profile_conflict(customer_id,image_id,incoming_raw_text,conflicts,source="history"):
+    if not conflicts: return
+    conn=get_conn(); conn.execute("INSERT INTO customer_profile_conflicts(customer_id,image_id,incoming_raw_text,conflict_json,source,created_time) VALUES(?,?,?,?,?,?)",(customer_id,image_id,incoming_raw_text,json.dumps(conflicts,ensure_ascii=False),source,now_iso())); conn.commit(); conn.close()
+
+
+def reindex_missing_signatures(limit=20):
+    conn=get_conn()
+    rows=conn.execute("""SELECT i.id,i.file_path FROM images i LEFT JOIN image_signatures s ON s.image_id=i.id WHERE s.image_id IS NULL ORDER BY i.id LIMIT ?""",(int(limit),)).fetchall()
+    done=0
+    try:
+        for row in rows:
+            if done>=int(limit):
+                break
+            p=_stored_path(row["file_path"])
+            if not p: continue
+            try:
+                img=read_image(p); _save_signatures(conn,int(row["id"]),build_signatures(img)); done+=1
+            except Exception: log.debug("reindex failed image=%s",row["id"],exc_info=True)
+        conn.commit(); return done
+    finally: conn.close()
+
+
+
+
+def reindex_missing_copy_features(limit=6):
+    """Background-upgrade old images with task-specific SSCD copy descriptors."""
+    conn=get_conn()
+    rows=conn.execute(
+        """SELECT i.id,i.file_path FROM images i
+           LEFT JOIN image_copy_features c ON c.image_id=i.id
+           WHERE c.image_id IS NULL AND i.file_path IS NOT NULL
+           ORDER BY i.id DESC LIMIT ?""",
+        (max(int(limit)*20,100),),
+    ).fetchall()
+    done=0
+    try:
+        if not rows:
+            return 0
+        from ai.copy_embedding import extract_copy_features
+        for row in rows:
+            if done>=int(limit):
+                break
+            p=_stored_path(row["file_path"])
+            if not p:
+                continue
+            try:
+                img=read_image(p)
+                views=extract_copy_features(img,max_views=4)
+                if views:
+                    save_copy_features(conn,int(row["id"]),views)
+                    done+=1
+            except Exception:
+                log.debug("SSCD reindex failed image=%s",row["id"],exc_info=True)
+        conn.commit()
+        return done
+    finally:
+        conn.close()
+
+
+def count_copy_index_status():
+    conn=get_conn()
+    try:
+        total=int(conn.execute("SELECT COUNT(*) FROM images").fetchone()[0] or 0)
+        indexed=int(conn.execute("SELECT COUNT(DISTINCT image_id) FROM image_copy_features").fetchone()[0] or 0)
+        return total,indexed,max(0,total-indexed)
+    finally:
+        conn.close()
+
+
+def cleanup_orphan_image_files(max_age_hours=24):
+    """Remove query/suspect temp images that were never added to the DB or pending buffer."""
+    import time
+    cutoff=time.time()-float(max_age_hours)*3600
+    conn=get_conn()
+    try:
+        refs=set()
+        for r in conn.execute("SELECT file_path FROM images WHERE file_path IS NOT NULL").fetchall():
+            p=_stored_path(r["file_path"])
+            if p: refs.add(str(p.resolve()))
+        for r in conn.execute("SELECT file_path FROM pending_buffer WHERE file_path IS NOT NULL").fetchall():
+            try: refs.add(str(Path(r["file_path"]).resolve()))
+            except Exception: pass
+    finally:
+        conn.close()
+    deleted=0
+    root=Path(IMAGE_DIR)
+    if not root.exists(): return 0
+    for p in root.rglob("*"):
+        if not p.is_file(): continue
+        try:
+            if str(p.resolve()) in refs: continue
+            if p.stat().st_mtime >= cutoff: continue
+            p.unlink(missing_ok=True); deleted+=1
+        except Exception: pass
+    return deleted
+
+
+def save_customer_only(submitter, submitter_id, chat_id, customer_data, raw_text, source="history", source_message_id=""):
+    conn=get_conn(); cur=conn.execute("""INSERT INTO customers(name,age,job,income,work_year,software,receiver,raw_text,submitter,submitter_id,chat_id,source,source_message_id,created_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(customer_data.get("name",""),customer_data.get("age",""),customer_data.get("job",""),customer_data.get("income",""),customer_data.get("work_year",""),customer_data.get("software",""),customer_data.get("receiver",""),raw_text or "",submitter,submitter_id,chat_id,source,str(source_message_id or ""),now_iso())); cid=cur.lastrowid; conn.commit(); conn.close(); return cid
+
+
+def update_customer_fields(customer_id:int,fields:dict,submitter_id:str|None=None,operator:str|None=None,operator_id:str|None=None)->bool:
+    allowed={"name","age","job","income","work_year","software","receiver"}; updates={k:str(v).strip() for k,v in fields.items() if k in allowed}
+    if not updates:return False
+    conn=get_conn()
+    try:
+        old=conn.execute("SELECT * FROM customers WHERE id=?",(customer_id,)).fetchone(); oldd=dict(old) if old else {}; ts=now_iso(); op=operator or submitter_id or "unknown"; opid=operator_id or submitter_id
+        set_clause=", ".join(f"{k}=?" for k in list(updates)+["updated_time","last_updated_by"]); vals=list(updates.values())+[ts,op]
+        if submitter_id is not None: sql=f"UPDATE customers SET {set_clause} WHERE id=? AND submitter_id=?"; vals += [customer_id,str(submitter_id)]
+        else: sql=f"UPDATE customers SET {set_clause} WHERE id=?"; vals += [customer_id]
+        cur=conn.execute(sql,vals)
+        if cur.rowcount:
+            for k,v in updates.items(): conn.execute("INSERT INTO customer_edit_log(customer_id,field_name,old_value,new_value,operator,operator_id,changed_time) VALUES(?,?,?,?,?,?,?)",(customer_id,k,str(oldd.get(k) or ""),v,op,opid,ts))
+        conn.commit(); return cur.rowcount>0
+    finally: conn.close()
+
+
+def get_customer_by_id(customer_id:int):
+    conn=get_conn(); row=conn.execute("SELECT * FROM customers WHERE id=?",(int(customer_id),)).fetchone(); conn.close(); return dict(row) if row else None

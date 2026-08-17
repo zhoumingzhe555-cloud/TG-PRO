@@ -17,7 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY requirements.txt ./
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --upgrade pip \
+ && pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.3,<3" \
+ && pip install -r requirements.txt
 COPY . .
 
 CMD ["python", "start.py"]

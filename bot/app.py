@@ -1,15 +1,17 @@
 import asyncio
 import logging
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters
-from config import BOT_TOKEN
+from config import BOT_TOKEN, REINDEX_BATCH_SIZE, REINDEX_INTERVAL_SEC, COPY_REINDEX_BATCH_SIZE, COPY_REINDEX_INTERVAL_SEC
 from bot.handler import (
     photo_handler, document_handler, collision_callback, text_handler,
     restore_pending_buffers, _PENDING_TTL, _PENDING_TEXT_TTL,
 )
-from bot.commands import start_command, help_command, stats_command
+from bot.commands import start_command, help_command, stats_command, ai_status_command
 from bot.recover import recover_images_command
 from ai.embedding import preload
+from ai.copy_embedding import preload as preload_copy_ai
 from core.database import cleanup_expired_pending_buffers
+from core.image_match import reindex_missing_signatures, reindex_missing_copy_features, count_copy_index_status, cleanup_orphan_image_files
 
 log = logging.getLogger(__name__)
 
@@ -37,16 +39,59 @@ async def _periodic_cleanup_pending_buffers(context) -> None:
         log.warning("定期清理 pending_buffer 失败（不影响机器人运行）", exc_info=True)
 
 
+
+
+async def _periodic_reindex(context) -> None:
+    """Background migration: enrich old V1.7 images with V1.8 multi-view signatures."""
+    try:
+        loop = asyncio.get_running_loop()
+        done = await loop.run_in_executor(None, reindex_missing_signatures, REINDEX_BATCH_SIZE)
+        if done:
+            log.info("多尺度Hash索引后台升级：本轮完成 %d 张", done)
+    except Exception:
+        log.warning("多尺度Hash索引后台升级失败（不影响实时检测）", exc_info=True)
+
+async def _periodic_copy_reindex(context) -> None:
+    """Gradually add SSCD descriptors to V1.8/V1.7 historical images."""
+    try:
+        loop=asyncio.get_running_loop()
+        done=await loop.run_in_executor(None,reindex_missing_copy_features,COPY_REINDEX_BATCH_SIZE)
+        if done:
+            total,indexed,missing=await loop.run_in_executor(None,count_copy_index_status)
+            log.info("V1.9 SSCD AI索引升级：本轮 %d 张；已完成 %d/%d，剩余 %d",done,indexed,total,missing)
+    except Exception:
+        log.warning("V1.9 SSCD AI索引升级失败（经典视觉仍可用）",exc_info=True)
+
+
+async def _periodic_cleanup_orphan_images(context) -> None:
+    try:
+        loop=asyncio.get_running_loop()
+        deleted=await loop.run_in_executor(None,cleanup_orphan_image_files,24)
+        if deleted:
+            log.info("清理未入库临时图片：%d 张",deleted)
+    except Exception:
+        log.warning("清理未入库临时图片失败（不影响机器人运行）",exc_info=True)
+
+
 async def _post_init(app):
     try:
         await app.bot.delete_webhook(drop_pending_updates=False)
     except Exception:
         pass
 
+    loop=asyncio.get_running_loop()
+    copy_ok=False
     try:
-        preload()
+        copy_ok=bool(await loop.run_in_executor(None,preload_copy_ai))
+        if not copy_ok:
+            log.warning("SSCD同图AI暂不可用，机器人将自动使用经典视觉+轻量AI备用")
     except Exception:
-        log.exception("AI模型预加载失败")
+        log.exception("SSCD同图AI预加载失败（不影响经典视觉检测）")
+    if not copy_ok:
+        try:
+            await loop.run_in_executor(None,preload)
+        except Exception:
+            log.exception("轻量AI备用模型预加载失败")
 
     if app.job_queue is None:
         log.warning(
@@ -73,6 +118,38 @@ async def _post_init(app):
     except Exception:
         log.warning("注册定期清理任务失败（不影响机器人运行）", exc_info=True)
 
+    try:
+        app.job_queue.run_repeating(
+            _periodic_reindex,
+            interval=REINDEX_INTERVAL_SEC,
+            first=8,
+            name="v18_reindex_signatures",
+        )
+        log.info("已注册 多尺度Hash旧图库后台索引升级任务：每 %d 秒最多 %d 张", REINDEX_INTERVAL_SEC, REINDEX_BATCH_SIZE)
+    except Exception:
+        log.warning("注册 多尺度Hash索引升级任务失败（不影响实时检测）", exc_info=True)
+
+    try:
+        app.job_queue.run_repeating(
+            _periodic_copy_reindex,
+            interval=COPY_REINDEX_INTERVAL_SEC,
+            first=12,
+            name="v19_reindex_sscd_copy_ai",
+        )
+        log.info("已注册 V1.9 SSCD AI旧图库升级任务：每 %d 秒最多 %d 张",COPY_REINDEX_INTERVAL_SEC,COPY_REINDEX_BATCH_SIZE)
+    except Exception:
+        log.warning("注册 V1.9 SSCD AI索引升级任务失败（不影响实时检测）",exc_info=True)
+
+    try:
+        app.job_queue.run_repeating(
+            _periodic_cleanup_orphan_images,
+            interval=6*3600,
+            first=3600,
+            name="v18_cleanup_orphan_images",
+        )
+    except Exception:
+        log.warning("注册临时图片清理任务失败（不影响实时检测）",exc_info=True)
+
 
 async def _error(update, context):
     log.exception("Telegram处理异常", exc_info=context.error)
@@ -94,6 +171,7 @@ def start():
     app.add_handler(CommandHandler("start", start_command, filters=GROUPS_ONLY))
     app.add_handler(CommandHandler("help", help_command, filters=GROUPS_ONLY))
     app.add_handler(CommandHandler("stats", stats_command, filters=GROUPS_ONLY))
+    app.add_handler(CommandHandler("aistatus", ai_status_command, filters=GROUPS_ONLY))
     app.add_handler(CommandHandler("recover_images", recover_images_command, filters=GROUPS_ONLY))
 
     # /edit、/cancel 以及私聊文字编辑流程已取消。
@@ -107,7 +185,7 @@ def start():
     app.add_handler(CallbackQueryHandler(collision_callback, pattern=r"^collision:"))
 
     app.add_error_handler(_error)
-    print("TG防撞客机器人 V1.7.1 AUTO90 ONE-PHOTO-ONE-CUSTOMER GitHub + Railway 启动（群聊专用 / 私聊关闭）")
+    print("TG防撞客机器人 V1.9 SSCD-AI COPY-GUARD AUTO90 GitHub + Railway 启动（群聊专用 / 私聊关闭）")
     app.run_polling(
         drop_pending_updates=False,
         allowed_updates=["message", "callback_query"],

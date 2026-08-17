@@ -1,29 +1,21 @@
-TG Anti-Collision Bot V1.7.1 - GitHub + Railway
+V1.9 GitHub + Railway 部署
 
-1. Upload ALL files and folders from this package to the ROOT of a GitHub repository.
-   Do not upload this ZIP itself as the only repository file.
-
-2. Create a Railway service from that GitHub repository.
-
-3. Railway Variables:
-   BOT_TOKEN=<your Telegram bot token>
+1. 解压 ZIP，把全部内容上传到 GitHub 仓库根目录。
+2. Railway 连接该 GitHub 仓库。
+3. Variables：
+   BOT_TOKEN=你的Token
    DATA_DIR=/data
+4. 给 worker 添加 Volume，Mount Path：/data
+5. 保持 1 Replica。
+6. 部署。
 
-4. Add a Railway Volume and mount it at:
-   /data
+成功启动日志应包含：
+TG防撞客机器人 V1.9 SSCD-AI COPY-GUARD AUTO90 GitHub + Railway 启动
+SSCD 同图识别 AI 模型加载成功
 
-5. Keep the Railway service at 1 replica (Telegram long polling).
+首次启动可能先下载约 99MB SSCD 模型，后续模型保存在 /data/models。
 
-6. Telegram group setup:
-   - Add the bot to the group.
-   - Make it an administrator, OR disable BotFather Privacy Mode so it can receive ordinary group photos.
-   - Private chat is intentionally disabled.
+升级旧数据库无需重新导入客户。V1.9 会自动迁移 SQLite 表结构，并后台补建 SSCD AI 索引。
+群里 /aistatus 查看进度。
 
-7. History import:
-   - Group administrators can send supported ZIP/JSON/HTML files to the group.
-   - V1.7.1 compact bundles contain history_manifest.json + photos/.
-   - One imported photo creates one customer even if no customer profile text exists.
-   - Exact duplicate photos are skipped as duplicates.
-
-Expected startup log:
-TG防撞客机器人 V1.7.1 ONE-PHOTO-ONE-CUSTOMER GitHub + Railway 启动（群聊专用 / 私聊关闭）
+重要：V1.9 在 Railway 上要求持久化 Volume。如果 Volume 未挂载，会直接停止启动，这是为了防止数据库临时丢失后把老客户全部误判为新客户。

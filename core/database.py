@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from config import DATABASE_PATH
+from config import DATABASE_PATH, DATA_DIR, REQUIRE_PERSISTENT_STORAGE
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +29,29 @@ def now_iso() -> str:
 def _resolve_db_path() -> Path:
     raw = str(DATABASE_PATH or "").strip()
     path = Path(raw) if raw else Path("data/customers.db")
+
+    # Railway production safety: never silently fall back to an ephemeral DB.
+    # If the /data Volume is missing/mis-mounted, refusing to start is safer than
+    # telling staff every existing customer is "new".
+    if REQUIRE_PERSISTENT_STORAGE:
+        mount_raw = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+        if os.getenv("RAILWAY_ENVIRONMENT") and not mount_raw:
+            raise RuntimeError(
+                "Railway Volume 未挂载：缺少 RAILWAY_VOLUME_MOUNT_PATH。"
+                "请把 Volume Mount Path 设置为 /data 后再启动。"
+            )
+        if mount_raw:
+            mount = Path(mount_raw).resolve()
+            try:
+                target = path.resolve()
+                if mount != target and mount not in target.parents:
+                    raise RuntimeError(
+                        f"数据库路径 {target} 不在 Railway Volume {mount} 内。"
+                        "请设置 DATA_DIR=/data。"
+                    )
+            except FileNotFoundError:
+                pass
+
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         probe = path.parent / ".db_write_test"
@@ -35,9 +59,11 @@ def _resolve_db_path() -> Path:
         probe.unlink(missing_ok=True)
         return path
     except Exception as exc:
+        if REQUIRE_PERSISTENT_STORAGE:
+            raise RuntimeError(f"持久化数据库目录不可写：{path.parent}: {exc}") from exc
         fallback = Path("data/customers.db")
         fallback.parent.mkdir(parents=True, exist_ok=True)
-        log.warning("数据库目录不可写 %s，自动回退到 %s：%s", path.parent, fallback, exc)
+        log.warning("数据库目录不可写 %s，开发环境回退到 %s：%s", path.parent, fallback, exc)
         return fallback
 
 
@@ -144,6 +170,85 @@ def init_db() -> None:
         )
         """)
 
+        _ensure_columns(conn, "collision_records", {
+            "query_phash":"TEXT", "query_file_path":"TEXT", "query_file_id":"TEXT", "query_file_unique_id":"TEXT",
+            "query_copy_feature":"BLOB", "query_copy_dim":"INTEGER DEFAULT 0",
+        })
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS image_signatures(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            image_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            phash TEXT, dhash TEXT,
+            b0 TEXT, b1 TEXT, b2 TEXT, b3 TEXT, b4 TEXT, b5 TEXT, b6 TEXT, b7 TEXT,
+            created_time TEXT,
+            UNIQUE(image_id, kind)
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS image_local_features(
+            image_id INTEGER PRIMARY KEY,
+            sift_kp BLOB, sift_desc BLOB, sift_rows INTEGER DEFAULT 0, sift_cols INTEGER DEFAULT 0, sift_dtype TEXT,
+            akaze_kp BLOB, akaze_desc BLOB, akaze_rows INTEGER DEFAULT 0, akaze_cols INTEGER DEFAULT 0, akaze_dtype TEXT,
+            updated_time TEXT
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS image_copy_features(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            image_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            feature BLOB NOT NULL,
+            dim INTEGER NOT NULL,
+            model_name TEXT,
+            simhash TEXT,
+            created_time TEXT,
+            UNIQUE(image_id, kind)
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS image_copy_lsh(
+            image_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            band INTEGER NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY(image_id, kind, band)
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS false_positive_pairs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            query_sha256 TEXT NOT NULL,
+            query_phash TEXT,
+            matched_image_id INTEGER NOT NULL,
+            confirmer_id TEXT,
+            created_time TEXT,
+            UNIQUE(query_sha256, matched_image_id)
+        )
+        """)
+        _ensure_columns(conn, "false_positive_pairs", {
+            "matched_customer_id":"INTEGER",
+            "query_copy_feature":"BLOB",
+            "query_copy_dim":"INTEGER DEFAULT 0",
+        })
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS customer_profile_conflicts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            image_id INTEGER,
+            incoming_raw_text TEXT,
+            conflict_json TEXT,
+            source TEXT,
+            created_time TEXT
+        )
+        """)
+
         conn.execute("""
         CREATE TABLE IF NOT EXISTS imports(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,7 +315,17 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_customers_created_time ON customers(created_time)",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_buffer_key ON pending_buffer(buffer_type, chat_id, user_id)",
             "CREATE INDEX IF NOT EXISTS idx_crash_logs_created ON crash_logs(created_time)",
+            "CREATE INDEX IF NOT EXISTS idx_sig_image ON image_signatures(image_id)",
+            "CREATE INDEX IF NOT EXISTS idx_false_query ON false_positive_pairs(query_sha256)",
+            "CREATE INDEX IF NOT EXISTS idx_false_match ON false_positive_pairs(matched_image_id)",
+            "CREATE INDEX IF NOT EXISTS idx_profile_conflict_customer ON customer_profile_conflicts(customer_id)",
+            "CREATE INDEX IF NOT EXISTS idx_copy_features_image ON image_copy_features(image_id)",
+            "CREATE INDEX IF NOT EXISTS idx_copy_features_simhash ON image_copy_features(simhash)",
+            "CREATE INDEX IF NOT EXISTS idx_copy_lsh_band_value ON image_copy_lsh(band,value)",
+            "CREATE INDEX IF NOT EXISTS idx_false_customer ON false_positive_pairs(matched_customer_id)",
         ]
+        for i in range(8):
+            index_sql.append(f"CREATE INDEX IF NOT EXISTS idx_sig_b{i} ON image_signatures(b{i})")
         for i in range(8):
             index_sql.append(f"CREATE INDEX IF NOT EXISTS idx_images_p{i} ON images(p{i})")
             index_sql.append(f"CREATE INDEX IF NOT EXISTS idx_images_a{i} ON images(a{i})")

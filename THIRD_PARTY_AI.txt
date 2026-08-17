@@ -1,0 +1,10 @@
+V1.9 AI component
+
+Primary copy-detection descriptor: Meta Research SSCD
+Project: A Self-Supervised Descriptor for Image Copy Detection (CVPR 2022)
+Model: sscd_disc_mixup TorchScript, 512-dimensional L2-normalized descriptor
+License: MIT (upstream codebase)
+
+The model binary is NOT bundled in this ZIP. Railway downloads the official pretrained TorchScript model on first startup and stores it under /data/models when the persistent Volume is mounted.
+
+This bot uses SSCD for same-photo / edited-copy detection. It does not perform face identity recognition.

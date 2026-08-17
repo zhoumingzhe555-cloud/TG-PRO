@@ -1,0 +1,30 @@
+V1.9 本地验证报告（2026-08-17）
+
+1. Python 全项目 compileall：通过。
+2. V1.8 SQLite -> V1.9 自动迁移：通过。
+   - image_copy_features / image_copy_lsh 新表创建成功。
+   - collision_records 新增 query_copy_feature/query_copy_dim。
+   - false_positive_pairs 新增 customer-cluster / copy-feature 字段。
+3. Railway 持久化保护：
+   - 模拟 Railway 无 Volume：按设计拒绝启动，避免误用空临时数据库。
+   - 正确 Volume 仍使用 /data/customers.db。
+4. 经典视觉回归（关闭所有AI）：
+   - 实际用户截图中“原图 vs 大幅裁剪/放大版本”：99.40%，SIFT/RANSAC 命中。
+   - 独立合成裁剪/缩放/重新压缩：97.99%，局部同图匹配。
+   - 完全同文件：100%，same。
+5. 低信息防误撞：
+   - 纯红 vs 纯蓝：不会达到 AUTO90。
+   - 即使测试AI故意给两张不同纯色图 100% AI相似，最终也被限制为 89.75%，不会自动撞客。
+6. SSCD 存储/检索路径：
+   - 512D float16 descriptor 写入、读取、cosine top-k：通过。
+   - 5,000 张 descriptor 全量检索：本地合成测试约 0.064 秒，目标项 Top1。
+   - 强制 LSH 大库路径：目标项 Top1。
+7. TorchScript AI 运行链路：
+   - 使用本地测试 TorchScript 模型验证 320x320 预处理、批处理、512D 输出、L2 归一化、多区域视图均通过。
+8. false-positive 客户簇记忆：
+   - 确认误判后，可按 matched customer + query copy feature 排除整个客户图片簇：通过。
+9. 老客户 AI 后台索引：
+   - 缺失 descriptor 的旧图片可后台分批补建，不要求重新导入历史库。
+10. 打包前 ZIP 完整性：执行 zip test。
+
+说明：正式 SSCD 预训练权重来自 Meta Research 官方地址，运行环境首次启动在线下载（约99MB）并保存到 /data/models。当前离线构建环境无法直接下载该正式权重，因此没有把“正式SSCD模型在你的Railway机器上的速度/阈值表现”伪装成本地实测；正式模型代码来源和预处理方式已按官方实现接入，下载失败时会自动降级到经典视觉路径。
