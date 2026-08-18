@@ -230,6 +230,23 @@ def init_db() -> None:
         """)
 
         conn.execute("""
+        CREATE TABLE IF NOT EXISTS image_account_ids(
+            image_id INTEGER NOT NULL,
+            account_id TEXT NOT NULL,
+            normalized_id TEXT NOT NULL,
+            created_time TEXT,
+            PRIMARY KEY(image_id, normalized_id)
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS image_account_id_scan(
+            image_id INTEGER PRIMARY KEY,
+            scanned_time TEXT
+        )
+        """)
+
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS false_positive_pairs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             query_sha256 TEXT NOT NULL,
@@ -364,6 +381,8 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_copy_features_simhash ON image_copy_features(simhash)",
             "CREATE INDEX IF NOT EXISTS idx_copy_lsh_band_value ON image_copy_lsh(band,value)",
             "CREATE INDEX IF NOT EXISTS idx_false_customer ON false_positive_pairs(matched_customer_id)",
+            "CREATE INDEX IF NOT EXISTS idx_image_account_norm ON image_account_ids(normalized_id)",
+            "CREATE INDEX IF NOT EXISTS idx_image_account_image ON image_account_ids(image_id)",
         ]
         for i in range(8):
             index_sql.append(f"CREATE INDEX IF NOT EXISTS idx_sig_b{i} ON image_signatures(b{i})")

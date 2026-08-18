@@ -238,8 +238,23 @@ def avatar_content_score(a_img: np.ndarray, b_img: np.ndarray, a_circle=None, b_
 
 
 def _normalize_account_id(value: str) -> str:
-    """Normalize OCR output without aggressively changing the ID itself."""
-    return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+    """Normalize HeyID OCR with conservative position-aware glyph repair.
+
+    Observed HeyID pages use a 3-letter prefix plus an 8-digit suffix. OCR often
+    confuses S/5, O/0, I/1 or B/8 in the numeric suffix. Repair only when the
+    whole token has the expected 11-character shape; otherwise leave it as-is.
+    """
+    raw=re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+    if len(raw)==11:
+        pfx=list(raw[:3]); sfx=list(raw[3:])
+        pmap={"0":"O","1":"I","5":"S","8":"B"}
+        dmap={"O":"0","Q":"0","D":"0","I":"1","L":"1","Z":"2","S":"5","G":"6","B":"8"}
+        pfx=[pmap.get(ch,ch) for ch in pfx]
+        sfx=[dmap.get(ch,ch) for ch in sfx]
+        cand="".join(pfx+sfx)
+        if re.fullmatch(r"[A-Z]{3}[0-9]{8}",cand):
+            return cand
+    return raw
 
 
 def _account_id_similarity(a: str, b: str) -> float:
@@ -295,74 +310,111 @@ def _account_id_same_confident(a: str, b: str) -> bool:
     return False
 
 
-def extract_template_account_id(img: np.ndarray, circle=None) -> str:
-    """Extract stable account identifiers such as ``HeyID: ABC123...``.
+def _cluster_account_ids(values: list[str]) -> list[str]:
+    """Collapse OCR variants of the same HeyID while preserving multiple cards.
 
-    This is deliberately narrow and is used only as a *disambiguator* for
-    template/profile-page screenshots.  A matching ID never creates a
-    collision by itself; a clearly different ID can veto a visual match that
-    was produced by a shared app template or generic placeholder avatar.
+    One screenshot may contain several profile cards. We keep one canonical ID
+    per visual/OCR cluster instead of returning only the first ID.
+    """
+    vals=[_normalize_account_id(v) for v in values if 6 <= len(_normalize_account_id(v)) <= 24]
+    clusters=[]
+    for v in vals:
+        placed=False
+        for cl in clusters:
+            if any(_account_id_same_confident(v,x) for x in cl):
+                cl.append(v); placed=True; break
+        if not placed:
+            clusters.append([v])
+    out=[]
+    for cl in clusters:
+        counts={x:cl.count(x) for x in set(cl)}
+        # Prefer the most repeated OCR reading, then the longest. Stable lexical
+        # tie-break keeps deterministic DB indexing.
+        best=max(counts, key=lambda x:(counts[x],len(x),x))
+        out.append(best)
+    return sorted(set(out))
+
+
+def extract_template_account_ids(img: np.ndarray, circle=None) -> list[str]:
+    """Extract *all* stable account IDs such as ``HeyID: ABC123...``.
+
+    V2.0.3: a Telegram image may itself contain two or more profile cards. The
+    old code only OCR'd below one prominent circle and returned the first ID,
+    which allowed template/UI similarity to win even when the real IDs were
+    different. We OCR the whole page plus overlapping vertical regions and
+    return every distinct HeyID.
     """
     if pytesseract is None or not shutil.which("tesseract"):
-        return ""
-    h, w = img.shape[:2]
+        return []
+    h,w=img.shape[:2]
     if h < 40 or w < 40:
-        return ""
+        return []
 
-    # The ID row normally sits below the prominent avatar.  Restrict OCR to
-    # that region to keep it fast and avoid Telegram/UI text outside the page.
-    y0, y1 = 0, h
+    regions=[img]
+    # Overlapping vertical windows greatly improve small grey HeyID text and
+    # multi-card screenshots without relying on one chosen avatar circle.
+    if h >= 180:
+        regions.extend([
+            img[0:max(1,int(h*0.52)),:],
+            img[max(0,int(h*0.32)):max(1,int(h*0.78)),:],
+            img[max(0,int(h*0.56)):h,:],
+        ])
+    # Keep the old focused below-avatar crop as one extra high-resolution view.
     if circle is not None:
-        _, cy, r = circle
-        y0 = max(0, int(cy + r * 0.65))
-        y1 = min(h, int(cy + r * 2.65))
-        if y1 - y0 < max(32, int(h * 0.12)):
-            y0 = max(0, int(h * 0.28))
-            y1 = min(h, int(h * 0.82))
-    else:
-        y0 = int(h * 0.20)
-        y1 = int(h * 0.82)
+        _,cy,r=circle
+        y0=max(0,int(cy+r*0.45)); y1=min(h,int(cy+r*3.0))
+        if y1-y0 >= 30:
+            regions.append(img[y0:y1,:])
 
-    x0 = max(0, int(w * 0.04))
-    x1 = min(w, int(w * 0.96))
-    crop = img[y0:y1, x0:x1]
-    if crop.size == 0:
-        return ""
-
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    scale = max(1.0, min(3.0, 900.0 / max(gray.shape[:2])))
-    if scale > 1.0:
-        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    # A light contrast stretch helps small grey HeyID text on white pages.
-    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-
-    texts = []
-    for psm in (6, 11):
-        try:
-            t = pytesseract.image_to_string(gray, lang="eng", config=f"--psm {psm}")
-        except Exception:
-            continue
-        if t:
-            texts.append(t)
-    text = "\n".join(texts)
-    if not text:
-        return ""
-
-    # OCR commonly reads HeyID as HeylD / Heyld / Hey1D.  Keep the prefix
-    # tolerant, but capture only a reasonably long alphanumeric identifier.
-    patterns = [
+    patterns=[
         r"H[e3]y\s*[Iil1|]\s*[Dd]\s*[:：]?\s*([A-Z0-9]{6,24})",
         r"H[e3]y[Iil1|][Dd]\s*[:：]?\s*([A-Z0-9]{6,24})",
     ]
-    up = text.upper()
-    for pat in patterns:
-        m = re.search(pat, up, flags=re.IGNORECASE)
-        if m:
-            value = _normalize_account_id(m.group(1))
-            if 6 <= len(value) <= 24:
-                return value
-    return ""
+    found=[]
+    for reg in regions:
+        if reg is None or reg.size == 0:
+            continue
+        gray=cv2.cvtColor(reg,cv2.COLOR_BGR2GRAY)
+        scale=max(1.0,min(3.5,1400.0/max(gray.shape[:2])))
+        if scale>1.0:
+            gray=cv2.resize(gray,None,fx=scale,fy=scale,interpolation=cv2.INTER_CUBIC)
+        gray=cv2.normalize(gray,None,0,255,cv2.NORM_MINMAX)
+        # Two segmentation modes are enough for both single-card and grid/card
+        # screenshots; avoid excessive OCR latency.
+        for psm in (6,11):
+            try:
+                text=pytesseract.image_to_string(gray,lang="eng",config=f"--psm {psm}")
+            except Exception:
+                continue
+            up=(text or "").upper()
+            for pat in patterns:
+                for m in re.finditer(pat,up,flags=re.IGNORECASE):
+                    value=_normalize_account_id(m.group(1))
+                    if 6 <= len(value) <= 24:
+                        found.append(value)
+    normalized=[_normalize_account_id(v) for v in found]
+    strict=[v for v in normalized if re.fullmatch(r"[A-Z]{3}[0-9]{8}",v)]
+    return _cluster_account_ids(strict if strict else normalized)
 
+
+def extract_template_account_id(img: np.ndarray, circle=None) -> str:
+    """Backward-compatible first-ID accessor."""
+    ids=extract_template_account_ids(img,circle)
+    return ids[0] if ids else ""
+
+
+def account_ids_overlap(a_ids, b_ids) -> bool:
+    """OCR-tolerant overlap between two sets of template account IDs."""
+    aa=[_normalize_account_id(x) for x in (a_ids or []) if x]
+    bb=[_normalize_account_id(x) for x in (b_ids or []) if x]
+    return any(_account_id_same_confident(a,b) for a in aa for b in bb)
+
+
+def normalize_account_id(value: str) -> str:
+    return _normalize_account_id(value)
+
+def account_id_same_confident(a: str, b: str) -> bool:
+    return _account_id_same_confident(a,b)
 
 def _avatar_information(img: np.ndarray, circle) -> float:
     """Return a rough 0..1 texture/content score for the avatar interior.
@@ -390,28 +442,23 @@ def analyze_template(img: np.ndarray) -> dict:
     metrics = _page_metrics(img)
     sat_circle = _saturation_circle(img)
     circle = sat_circle or _hough_circle(img)
-    account_id = ""
-    avatar_info = 1.0
-    if circle is not None:
-        avatar_info = _avatar_information(img, circle)
-    # OCR is intentionally limited to page-like layouts; ordinary customer
-    # photos never pay this cost.
-    if metrics.get("page_like") and circle is not None:
-        account_id = extract_template_account_id(img, circle)
+    avatar_info = _avatar_information(img, circle) if circle is not None else 1.0
+    # V2.0.3: ID extraction is allowed on page-like screenshots even if one
+    # prominent circle cannot be found. Multi-card screenshots often contain
+    # several smaller circles and are exactly where ID should be authoritative.
+    account_ids=[]
+    if metrics.get("page_like") or circle is not None:
+        account_ids=extract_template_account_ids(img,circle)
     return {
         **metrics,
         "circle": circle,
         "has_circle": circle is not None,
         "avatar_information": round(float(avatar_info), 4),
         "generic_avatar": bool(circle is not None and avatar_info < 0.42),
-        "account_id": account_id,
-        # Saturation-connected-component detection is much more reliable for
-        # filled/gradient profile avatars than Hough on UI screenshots. Hard
-        # vetoes require reliable circles on both sides; Hough-only detections
-        # can still contribute a caution signal but never suppress a match alone.
+        "account_ids": account_ids,
+        "account_id": account_ids[0] if account_ids else "",
         "circle_reliable": sat_circle is not None,
     }
-
 
 def compare_template(query_img: np.ndarray, cand_img: np.ndarray, query_profile: dict | None = None) -> dict:
     q = query_profile or analyze_template(query_img)
@@ -422,41 +469,26 @@ def compare_template(query_img: np.ndarray, cand_img: np.ndarray, query_profile:
     if both_circle:
         avatar_score = avatar_content_score(query_img, cand_img, q.get("circle"), c.get("circle"))
 
-    # Hard veto is intentionally narrow.  In addition to visibly different
-    # avatar content, V2.0.1 also uses a stable in-page account ID (e.g. HeyID)
-    # as a *negative* signal. Two clearly different IDs mean the shared app
-    # template / placeholder cannot be the same customer image.
     reliable_pair = bool(q.get("circle_reliable") and c.get("circle_reliable"))
-    qid = str(q.get("account_id") or "")
-    cid = str(c.get("account_id") or "")
-    id_similarity = _account_id_similarity(qid, cid) if qid and cid else 0.0
-    same_id_confident = bool(qid and cid and _account_id_same_confident(qid, cid))
-    # Different readable IDs are a very strong negative signal on a shared
-    # profile-page template.  Use a slightly looser conflict threshold for
-    # diagnostics, but the OCR-tolerant equality check above decides whether
-    # two public placeholders are allowed to proceed at all.
-    id_conflict = bool(qid and cid and not same_id_confident and id_similarity < 0.88)
-    both_generic = bool(q.get("generic_avatar") and c.get("generic_avatar"))
+    qids=list(q.get("account_ids") or ([q.get("account_id")] if q.get("account_id") else []))
+    cids=list(c.get("account_ids") or ([c.get("account_id")] if c.get("account_id") else []))
+    id_primary_match=bool(qids and cids and account_ids_overlap(qids,cids))
+    # If both screenshots expose one or more HeyIDs and no ID overlaps, the IDs
+    # are authoritative for this template family. Shared UI / same placeholder
+    # numeral is never allowed to override a different account ID.
+    id_conflict=bool(qids and cids and not id_primary_match)
+    both_generic=bool(q.get("generic_avatar") and c.get("generic_avatar"))
 
-    avatar_veto = bool(both_page and both_circle and reliable_pair and avatar_score < 56.0)
-    id_veto = bool(both_page and id_conflict)
-
-    # V2.0.2 PLACEHOLDER-GUARD: a single digit/letter/symbol on the app's
-    # gradient circle is a *public placeholder*, not a unique customer photo.
-    # Therefore a pair of generic placeholders is never allowed to create even
-    # a suspect collision unless both page IDs are confidently the same.  If
-    # OCR cannot read one side, we intentionally prefer a missed placeholder
-    # collision over falsely merging two customers who both happen to use "8".
-    generic_placeholder_veto = bool(
-        both_page and both_circle and both_generic and not same_id_confident
+    avatar_veto=bool(both_page and both_circle and reliable_pair and avatar_score < 56.0 and not id_primary_match)
+    id_veto=bool(id_conflict)
+    generic_placeholder_veto=bool(
+        both_page and both_circle and both_generic and not id_primary_match
     )
-    generic_ambiguous = generic_placeholder_veto
-
-    veto = bool(avatar_veto or id_veto or generic_placeholder_veto)
-    caution = bool(
-        (both_page and both_circle and avatar_score < 68.0)
-        or generic_ambiguous
-        or (both_page and qid and cid and not same_id_confident)
+    veto=bool(avatar_veto or id_veto or generic_placeholder_veto)
+    caution=bool(
+        (both_page and both_circle and avatar_score < 68.0 and not id_primary_match)
+        or (both_generic and not id_primary_match)
+        or id_conflict
     )
     return {
         "template_like": both_page,
@@ -467,11 +499,13 @@ def compare_template(query_img: np.ndarray, cand_img: np.ndarray, query_profile:
         "circle_reliable_pair": reliable_pair,
         "query_page_like": bool(q.get("page_like")),
         "candidate_page_like": bool(c.get("page_like")),
-        "query_account_id": qid,
-        "candidate_account_id": cid,
-        "account_id_similarity": round(float(id_similarity * 100.0), 2) if qid and cid else 0.0,
-        "account_id_same_confident": same_id_confident,
+        "query_account_ids": qids,
+        "candidate_account_ids": cids,
+        "query_account_id": qids[0] if qids else "",
+        "candidate_account_id": cids[0] if cids else "",
+        "account_id_primary_match": id_primary_match,
         "account_id_conflict": id_conflict,
         "generic_avatar_pair": both_generic,
         "generic_placeholder_veto": generic_placeholder_veto,
     }
+

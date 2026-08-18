@@ -5,7 +5,7 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 from core.database import get_conn
-from core.image_match import count_copy_index_status
+from core.image_match import count_copy_index_status, count_account_id_index_status
 from config import SSCD_MODEL_PATH, SSCD_ENABLED
 
 log = logging.getLogger(__name__)
@@ -87,6 +87,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ai_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         total,indexed,missing=count_copy_index_status()
+        try:
+            id_total,id_scanned,id_missing,id_images=count_account_id_index_status()
+        except Exception:
+            id_total,id_scanned,id_missing,id_images=total,0,total,0
         model_ok=bool(SSCD_ENABLED and SSCD_MODEL_PATH.exists() and SSCD_MODEL_PATH.stat().st_size>80_000_000)
         pct=(indexed/total*100.0) if total else 100.0
         text=(
@@ -95,7 +99,8 @@ async def ai_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"图库图片：{total:,}\n"
             f"AI已索引：{indexed:,}\n"
             f"待补索引：{missing:,}\n"
-            f"完成度：{pct:.1f}%"
+            f"完成度：{pct:.1f}%\n"
+            f"🪪 页面ID扫描：{id_scanned:,}/{id_total:,}（待补：{id_missing:,}，含ID图片：{id_images:,}）"
         )
         await update.message.reply_text(text,parse_mode="Markdown")
     except Exception:
