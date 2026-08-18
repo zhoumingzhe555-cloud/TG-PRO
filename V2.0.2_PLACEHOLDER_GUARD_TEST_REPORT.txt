@@ -1,0 +1,18 @@
+V2.0.2 PLACEHOLDER-GUARD TEST REPORT
+
+测试对象：用户提供的 HeyID 公共模板截图（两个头像均为数字 8，但账号 ID 不同）。
+
+结果：
+1. 页面A OCR账号：FCN55877549（原图首字符 OCR 有轻微误读，但可稳定提取）
+2. 页面B OCR账号：DSO56175406
+3. 两张均识别为 page_like + generic_avatar
+4. generic_placeholder_veto = True
+5. 整体 check_image 回归：new，0.0，不再产生 85~89.99% 疑似撞客
+6. 同一页面 JPEG 重新编码：账号仍判断为同一 ID，placeholder veto = False
+7. 同一原文件再次检测：same，100%
+
+安全规则：
+- 公共数字/字母/符号占位头像不能单独构成撞客证据。
+- 两个公共占位头像页面只有账号 ID 被可靠判断为同一 ID，才允许继续进入正常同图判断。
+- ID 不同，或任一侧 ID 无法可靠读取：阻断模板误撞。
+- 同 ID 也不会单靠 ID 判撞客，仍需图片证据。

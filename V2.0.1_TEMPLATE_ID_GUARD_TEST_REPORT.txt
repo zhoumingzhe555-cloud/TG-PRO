@@ -1,0 +1,20 @@
+V2.0.1 TEMPLATE-ID-GUARD TEST REPORT
+
+Test case from supplied screenshot:
+- Template A: gradient circle placeholder "8", OCR account ID FCN55877549
+- Template B: gradient circle placeholder "8", OCR account ID DSO56175406
+- Both detected as page templates
+- Both detected as low-information/generic avatars
+- Account-ID similarity: 36.36%
+- Result: template_veto = True (must not become suspect/collision)
+
+Regression:
+- Same lower template recompressed to JPEG quality 65
+- OCR account ID remains DSO56175406 on both
+- Account-ID similarity: 100%
+- template_veto = False
+- Existing SSCD/Hash/SAFE-MATCH pipeline remains responsible for actual same-photo decision
+
+Safety policy:
+- Account ID is only negative/disambiguation evidence.
+- Same account ID alone never creates a collision.
