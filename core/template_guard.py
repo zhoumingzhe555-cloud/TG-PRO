@@ -15,6 +15,14 @@ module is called.
 
 import cv2
 import numpy as np
+import re
+import shutil
+from difflib import SequenceMatcher
+
+try:
+    import pytesseract
+except Exception:  # optional at import-time; Docker installs it
+    pytesseract = None
 
 
 def _resize_max(img: np.ndarray, max_side: int = 720) -> tuple[np.ndarray, float]:
@@ -228,14 +236,175 @@ def avatar_content_score(a_img: np.ndarray, b_img: np.ndarray, a_circle=None, b_
     return float(max(scores))
 
 
+
+def _normalize_account_id(value: str) -> str:
+    """Normalize OCR output without aggressively changing the ID itself."""
+    return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+
+
+def _account_id_similarity(a: str, b: str) -> float:
+    a = _normalize_account_id(a)
+    b = _normalize_account_id(b)
+    if not a or not b:
+        return 0.0
+    return float(SequenceMatcher(None, a, b).ratio())
+
+
+# OCR on small grey account IDs can confuse visually similar glyphs.  These
+# groups are used only to decide whether two OCR strings are *probably the same
+# account*.  They never turn an ID into positive collision evidence by itself.
+_ID_CONFUSION_GROUPS = (
+    set("0ODQ"), set("1IL|"), set("2Z"), set("5S"), set("6G"), set("8B"),
+)
+
+def _id_char_equivalent(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    return any(a in g and b in g for g in _ID_CONFUSION_GROUPS)
+
+def _account_id_same_confident(a: str, b: str) -> bool:
+    """Conservative OCR-tolerant equality check for template account IDs.
+
+    Same-ID is used only to *remove* the generic-placeholder veto.  It is never
+    sufficient to declare a collision.  We therefore prefer false negatives
+    here over allowing two public placeholder avatars to become a false match.
+    """
+    a = _normalize_account_id(a)
+    b = _normalize_account_id(b)
+    if len(a) < 7 or len(b) < 7:
+        return False
+    if a == b:
+        return True
+    # Most OCR mistakes keep length. Allow at most one visually-confusable
+    # position or one ordinary mismatch on a long ID.
+    if len(a) == len(b):
+        hard = 0
+        soft = 0
+        for x, y in zip(a, b):
+            if x == y:
+                continue
+            if _id_char_equivalent(x, y):
+                soft += 1
+            else:
+                hard += 1
+        return hard == 0 and soft <= 2 or (hard <= 1 and soft == 0 and len(a) >= 9)
+    # One dropped/inserted OCR character is tolerated only when the rest aligns
+    # almost perfectly.
+    if abs(len(a) - len(b)) == 1 and SequenceMatcher(None, a, b).ratio() >= 0.92:
+        return True
+    return False
+
+
+def extract_template_account_id(img: np.ndarray, circle=None) -> str:
+    """Extract stable account identifiers such as ``HeyID: ABC123...``.
+
+    This is deliberately narrow and is used only as a *disambiguator* for
+    template/profile-page screenshots.  A matching ID never creates a
+    collision by itself; a clearly different ID can veto a visual match that
+    was produced by a shared app template or generic placeholder avatar.
+    """
+    if pytesseract is None or not shutil.which("tesseract"):
+        return ""
+    h, w = img.shape[:2]
+    if h < 40 or w < 40:
+        return ""
+
+    # The ID row normally sits below the prominent avatar.  Restrict OCR to
+    # that region to keep it fast and avoid Telegram/UI text outside the page.
+    y0, y1 = 0, h
+    if circle is not None:
+        _, cy, r = circle
+        y0 = max(0, int(cy + r * 0.65))
+        y1 = min(h, int(cy + r * 2.65))
+        if y1 - y0 < max(32, int(h * 0.12)):
+            y0 = max(0, int(h * 0.28))
+            y1 = min(h, int(h * 0.82))
+    else:
+        y0 = int(h * 0.20)
+        y1 = int(h * 0.82)
+
+    x0 = max(0, int(w * 0.04))
+    x1 = min(w, int(w * 0.96))
+    crop = img[y0:y1, x0:x1]
+    if crop.size == 0:
+        return ""
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    scale = max(1.0, min(3.0, 900.0 / max(gray.shape[:2])))
+    if scale > 1.0:
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    # A light contrast stretch helps small grey HeyID text on white pages.
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+
+    texts = []
+    for psm in (6, 11):
+        try:
+            t = pytesseract.image_to_string(gray, lang="eng", config=f"--psm {psm}")
+        except Exception:
+            continue
+        if t:
+            texts.append(t)
+    text = "\n".join(texts)
+    if not text:
+        return ""
+
+    # OCR commonly reads HeyID as HeylD / Heyld / Hey1D.  Keep the prefix
+    # tolerant, but capture only a reasonably long alphanumeric identifier.
+    patterns = [
+        r"H[e3]y\s*[Iil1|]\s*[Dd]\s*[:：]?\s*([A-Z0-9]{6,24})",
+        r"H[e3]y[Iil1|][Dd]\s*[:：]?\s*([A-Z0-9]{6,24})",
+    ]
+    up = text.upper()
+    for pat in patterns:
+        m = re.search(pat, up, flags=re.IGNORECASE)
+        if m:
+            value = _normalize_account_id(m.group(1))
+            if 6 <= len(value) <= 24:
+                return value
+    return ""
+
+
+def _avatar_information(img: np.ndarray, circle) -> float:
+    """Return a rough 0..1 texture/content score for the avatar interior.
+
+    Generic placeholders (single digit/letter on a smooth gradient) have very
+    little interior structure and must not be treated as a unique customer
+    photo merely because the placeholder itself is identical.
+    """
+    patch = _circle_patch(img, circle, size=192)
+    if patch is None:
+        return 1.0
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    n = gray.shape[0]
+    yy, xx = np.ogrid[:n, :n]
+    mask = ((xx - n / 2) ** 2 + (yy - n / 2) ** 2) <= (n * 0.34) ** 2
+    edges = cv2.Canny(gray, 60, 160) > 0
+    edge_density = float(np.sum(edges & mask)) / max(1, int(mask.sum()))
+    lap = cv2.Laplacian(gray, cv2.CV_32F)
+    lap_std = float(np.std(lap[mask])) if np.any(mask) else 0.0
+    # Conservative score: portraits/photos tend to exceed this comfortably,
+    # while a single numeral on a smooth gradient remains low.
+    return float(min(1.0, edge_density / 0.12 * 0.65 + lap_std / 45.0 * 0.35))
+
 def analyze_template(img: np.ndarray) -> dict:
     metrics = _page_metrics(img)
     sat_circle = _saturation_circle(img)
     circle = sat_circle or _hough_circle(img)
+    account_id = ""
+    avatar_info = 1.0
+    if circle is not None:
+        avatar_info = _avatar_information(img, circle)
+    # OCR is intentionally limited to page-like layouts; ordinary customer
+    # photos never pay this cost.
+    if metrics.get("page_like") and circle is not None:
+        account_id = extract_template_account_id(img, circle)
     return {
         **metrics,
         "circle": circle,
         "has_circle": circle is not None,
+        "avatar_information": round(float(avatar_info), 4),
+        "generic_avatar": bool(circle is not None and avatar_info < 0.42),
+        "account_id": account_id,
         # Saturation-connected-component detection is much more reliable for
         # filled/gradient profile avatars than Hough on UI screenshots. Hard
         # vetoes require reliable circles on both sides; Hough-only detections
@@ -253,13 +422,42 @@ def compare_template(query_img: np.ndarray, cand_img: np.ndarray, query_profile:
     if both_circle:
         avatar_score = avatar_content_score(query_img, cand_img, q.get("circle"), c.get("circle"))
 
-    # Hard veto is intentionally narrow: only a page-template pair with two
-    # prominent avatar circles whose *interior content* is clearly different.
-    # Shared gradient circles/white background/text layout then cannot create a
-    # false 'same photo' suspect. True same-avatar copies remain high here.
+    # Hard veto is intentionally narrow.  In addition to visibly different
+    # avatar content, V2.0.1 also uses a stable in-page account ID (e.g. HeyID)
+    # as a *negative* signal. Two clearly different IDs mean the shared app
+    # template / placeholder cannot be the same customer image.
     reliable_pair = bool(q.get("circle_reliable") and c.get("circle_reliable"))
-    veto = bool(both_page and both_circle and reliable_pair and avatar_score < 56.0)
-    caution = bool(both_page and both_circle and avatar_score < 68.0)
+    qid = str(q.get("account_id") or "")
+    cid = str(c.get("account_id") or "")
+    id_similarity = _account_id_similarity(qid, cid) if qid and cid else 0.0
+    same_id_confident = bool(qid and cid and _account_id_same_confident(qid, cid))
+    # Different readable IDs are a very strong negative signal on a shared
+    # profile-page template.  Use a slightly looser conflict threshold for
+    # diagnostics, but the OCR-tolerant equality check above decides whether
+    # two public placeholders are allowed to proceed at all.
+    id_conflict = bool(qid and cid and not same_id_confident and id_similarity < 0.88)
+    both_generic = bool(q.get("generic_avatar") and c.get("generic_avatar"))
+
+    avatar_veto = bool(both_page and both_circle and reliable_pair and avatar_score < 56.0)
+    id_veto = bool(both_page and id_conflict)
+
+    # V2.0.2 PLACEHOLDER-GUARD: a single digit/letter/symbol on the app's
+    # gradient circle is a *public placeholder*, not a unique customer photo.
+    # Therefore a pair of generic placeholders is never allowed to create even
+    # a suspect collision unless both page IDs are confidently the same.  If
+    # OCR cannot read one side, we intentionally prefer a missed placeholder
+    # collision over falsely merging two customers who both happen to use "8".
+    generic_placeholder_veto = bool(
+        both_page and both_circle and both_generic and not same_id_confident
+    )
+    generic_ambiguous = generic_placeholder_veto
+
+    veto = bool(avatar_veto or id_veto or generic_placeholder_veto)
+    caution = bool(
+        (both_page and both_circle and avatar_score < 68.0)
+        or generic_ambiguous
+        or (both_page and qid and cid and not same_id_confident)
+    )
     return {
         "template_like": both_page,
         "both_circle": both_circle,
@@ -269,4 +467,11 @@ def compare_template(query_img: np.ndarray, cand_img: np.ndarray, query_profile:
         "circle_reliable_pair": reliable_pair,
         "query_page_like": bool(q.get("page_like")),
         "candidate_page_like": bool(c.get("page_like")),
+        "query_account_id": qid,
+        "candidate_account_id": cid,
+        "account_id_similarity": round(float(id_similarity * 100.0), 2) if qid and cid else 0.0,
+        "account_id_same_confident": same_id_confident,
+        "account_id_conflict": id_conflict,
+        "generic_avatar_pair": both_generic,
+        "generic_placeholder_veto": generic_placeholder_veto,
     }
