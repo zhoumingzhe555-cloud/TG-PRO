@@ -1,4 +1,17 @@
-# V1.9.8 PRECHECKED-NEW DIRECT-ENTRY + AUTO-FIND-IMAGE + EDITED-CAPTION-ENTRY + REVIEW-FIX + MATCH-PREVIEW
+# V2.0 TEMPLATE-GUARD + V1.9.9 CLEAN-ENTRY-REPLY
+
+## 本版新增：模板页防误撞
+
+针对交友软件/社交软件中大量复用同一 UI 模板、同一渐变圆形头像框、同一白底版式的情况：
+
+- 不再把公共页面模板当成客户照片特征。
+- 当两张图都是资料页模板，并且都检测到可靠的大圆形头像区域时，额外比较**圆形头像内部的高频内容**。
+- 同样的粉色渐变圆、同样的页面布局，但圆内是不同数字/汉字/不同头像时，会直接阻止“疑似撞客”。
+- 完全同图 SHA256/MD5 仍然 100% 撞客。
+- 同一头像经过 JPEG 压缩、缩放、左右镜像仍可正常通过同图识别。
+- 这个 Guard 只负责**否决模板造成的假相似**，不会单独制造撞客。
+
+# V1.9.9 CLEAN-ENTRY-REPLY + PRECHECKED-NEW DIRECT-ENTRY + AUTO-FIND-IMAGE + EDITED-CAPTION-ENTRY + REVIEW-FIX + MATCH-PREVIEW
 
 ## 实时客户入库规则
 
@@ -122,3 +135,8 @@ Telegram 图片 caption/备注中包含正式客户资料时，图片与资料�
 - 正式客户资料后来回复原图或回复与原图绑定的查询文字时，自动找到原图并直接入库，不要求再次补图。
 - 已确认撞客不入库；疑似撞客仍需审核。误判后图片状态恢复为 `new`。
 - 正式入库时即时生成 SSCD AI 特征。
+
+
+## V1.9.9 入库回执精简
+
+正式客户成功入库后，机器人只回复 `✅ 新客户已入库`，不再重复发送姓名、年龄、职业、引流软件、接粉人员等客户资料。客户资料仍完整保存到 `/data/customers.db`。

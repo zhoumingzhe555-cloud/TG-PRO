@@ -796,11 +796,9 @@ async def _save_group_customer(msg, file_id, file_unique_id, path, user, chat, i
         await msg.reply_text("❌ 入库失败，请重试")
         return False
     if inserted:
-        summary = _format_customer_summary(public_customer_data(info))
-        reply = "✅ *新客户已入库*"
-        if summary:
-            reply += f"\n\n{summary}"
-        await msg.reply_text(reply, parse_mode="Markdown")
+        # V1.9.9: 客户资料已经存在于原消息中，入库成功后只回执状态，
+        # 不再把姓名/年龄/职业等资料重复发送一遍，减少群聊刷屏。
+        await msg.reply_text("✅ *新客户已入库*", parse_mode="Markdown")
     else:
         await msg.reply_text("ℹ️ 该图片已存在，未重复添加")
     return True

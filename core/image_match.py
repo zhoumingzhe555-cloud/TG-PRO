@@ -21,6 +21,7 @@ from core.image_features import (
     pack_local_feature, unpack_local_feature,
 )
 from core.object_storage import is_object_key, object_key_path
+from core.template_guard import analyze_template, compare_template
 from ai.embedding import cosine_score
 from core.copy_index import save_copy_features, load_copy_features, copy_candidate_scores, pack_copy_feature, unpack_copy_feature
 
@@ -326,18 +327,29 @@ def _geometry_score(query_img, candidate_path: Path, qcache=None, conn=None, ima
             qcache["normal"]={"local":local_features(query_img),"gray":prepared_gray(query_img)}
         candidate_local=_load_or_build_candidate_local(conn,int(image_id),cand_img) if conn is not None and image_id is not None else local_features(cand_img)
         normal=_geometry_once(query_img,cand_img,qcache["normal"],candidate_local)
-        if normal.get("score",0)>=90:
-            return normal
-        if "mirror_img" not in qcache:
-            qcache["mirror_img"]=cv2.flip(query_img,1)
-            qcache["mirror"]={"local":local_features(qcache["mirror_img"]),"gray":prepared_gray(qcache["mirror_img"])}
-        mirrored=_geometry_once(qcache["mirror_img"],cand_img,qcache["mirror"],candidate_local)
-        if mirrored.get("score",0)>normal.get("score",0):
-            mirrored["method"]=(mirrored.get("method") or "")+"+MIRROR"
-            return mirrored
-        return normal
+        best=normal
+        # Only pay for mirror geometry when normal geometry is not already strong.
+        if normal.get("score",0)<90:
+            if "mirror_img" not in qcache:
+                qcache["mirror_img"]=cv2.flip(query_img,1)
+                qcache["mirror"]={"local":local_features(qcache["mirror_img"]),"gray":prepared_gray(qcache["mirror_img"])}
+            mirrored=_geometry_once(qcache["mirror_img"],cand_img,qcache["mirror"],candidate_local)
+            if mirrored.get("score",0)>normal.get("score",0):
+                mirrored["method"]=(mirrored.get("method") or "")+"+MIRROR"
+                best=mirrored
+
+        # V2.0 TEMPLATE-GUARD: profile-page/app templates can share circles,
+        # white canvases, text rows and buttons across unrelated customers.
+        # Compare the customer-specific content inside a reliable avatar circle
+        # and allow that evidence to veto a template-only false match.
+        if "template_profile" not in qcache:
+            qcache["template_profile"]=analyze_template(query_img)
+        tg=compare_template(query_img,cand_img,qcache["template_profile"])
+        best.update(tg)
+        return best
     except Exception:
-        return {"score":0.0,"inliers":0,"ratio":0.0,"H":None,"method":"","ssim":0.0,"overlap":0.0,"mutual":0,"coverage_q":0.0,"coverage_c":0.0,"homography_sane":False}
+        return {"score":0.0,"inliers":0,"ratio":0.0,"H":None,"method":"","ssim":0.0,"overlap":0.0,"mutual":0,"coverage_q":0.0,"coverage_c":0.0,"homography_sane":False,
+                "template_like":False,"template_veto":False,"template_caution":False,"avatar_content_score":0.0,"circle_reliable_pair":False}
 
 def _fetch_light_rows_by_ids(conn, ids):
     ids=list({int(x) for x in ids if x is not None})
@@ -495,6 +507,7 @@ def check_image(path):
                 **item,"deep":deep,"orb":orb,"ai":ai,"copy_ai":copy_ai,"hist":hist,
                 "base":base,"geometry":0.0,"inliers":0,"geom_ratio":0.0,"geom_method":"",
                 "ssim":0.0,"overlap":0.0,"mutual":0,"coverage_q":0.0,"coverage_c":0.0,"homography_sane":False,
+                "template_like":False,"template_veto":False,"template_caution":False,"avatar_content_score":0.0,"circle_reliable_pair":False,
             })
         evaluated.sort(key=lambda x:max(x["base"],x["rank"],x["copy_ai"]),reverse=True)
 
@@ -511,6 +524,9 @@ def check_image(path):
                 item["geometry"]=g["score"]; item["inliers"]=g["inliers"]; item["geom_ratio"]=g["ratio"]
                 item["geom_method"]=g.get("method",""); item["ssim"]=g.get("ssim",0.0); item["overlap"]=g.get("overlap",0.0)
                 item["mutual"]=g.get("mutual",0); item["coverage_q"]=g.get("coverage_q",0.0); item["coverage_c"]=g.get("coverage_c",0.0); item["homography_sane"]=bool(g.get("homography_sane",False))
+                item["template_like"]=bool(g.get("template_like",False)); item["template_veto"]=bool(g.get("template_veto",False))
+                item["template_caution"]=bool(g.get("template_caution",False)); item["avatar_content_score"]=float(g.get("avatar_content_score",0.0) or 0.0)
+                item["circle_reliable_pair"]=bool(g.get("circle_reliable_pair",False))
 
         best=None
         for item in evaluated:
@@ -604,6 +620,23 @@ def check_image(path):
                 or (not low_info and item["copy_ai"] >= 90 and (item["p"] >= 76 or item["roi"] >= 76 or geom_mid))
             )
 
+            # V2.0 TEMPLATE-GUARD: if both images are page templates with
+            # reliable prominent avatar circles but the *inside content* of the
+            # circles is clearly different, the shared UI must not produce even
+            # a suspect collision. This directly blocks cases such as the same
+            # HeyID page/gradient-circle layout containing different symbols or
+            # different customer avatars.
+            if item.get("template_veto"):
+                strong=False
+                suspect_evidence=False
+                score=min(score,SIMILAR_THRESHOLD-0.25)
+            elif item.get("template_caution") and item.get("template_like"):
+                # Hough-only/less-certain circle detections never hard-veto. They
+                # simply require a genuinely strong independent copy signal.
+                if not (item["copy_ai"]>=92 and (geom_mid or hash_signal)):
+                    suspect_evidence=False
+                    score=min(score,SIMILAR_THRESHOLD-0.25)
+
             if not strong:
                 score=min(score,AUTO_COLLISION_THRESHOLD-0.25)
             if not suspect_evidence:
@@ -618,6 +651,8 @@ def check_image(path):
                 or (not low_info and item["copy_ai"]>=90 and item["geometry"]>=82 and item["inliers"]>=12)
                 or (strong_hash and item["copy_ai"]>=80)
             )
+            if item.get("template_veto"):
+                learn_safe=False
             cur={**item,"score":score,"strong":strong,"learn_safe":learn_safe,"independent":independent,"suspect_evidence":suspect_evidence,"evidence_count":evidence_count}
             if best is None or cur["score"]>best["score"]:
                 best=cur
@@ -641,6 +676,8 @@ def check_image(path):
                     "overlap":round(best.get("overlap",0.0),3),"mutual":int(best.get("mutual",0)),
                     "coverage_q":round(float(best.get("coverage_q",0.0)),4),"coverage_c":round(float(best.get("coverage_c",0.0)),4),
                     "homography_sane":bool(best.get("homography_sane",False)),"low_information":low_info,
+                    "template_like":bool(best.get("template_like",False)),"template_veto":bool(best.get("template_veto",False)),
+                    "avatar_content_score":round(float(best.get("avatar_content_score",0.0) or 0.0),2),
                     "blur":round(float(quality.get("lap_var") or 0.0),2),
                 },
             }
