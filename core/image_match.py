@@ -21,9 +21,9 @@ from core.image_features import (
     pack_local_feature, unpack_local_feature,
 )
 from core.object_storage import is_object_key, object_key_path
-from core.template_guard import analyze_template, compare_template, extract_template_account_ids, normalize_account_id, account_id_same_confident
 from ai.embedding import cosine_score
 from core.copy_index import save_copy_features, load_copy_features, copy_candidate_scores, pack_copy_feature, unpack_copy_feature
+from core.special_id_guard import analyze_special_page, analyze_special_path, normalize_external_id
 
 log = logging.getLogger(__name__)
 _SAVE_LOCK = threading.Lock()
@@ -57,61 +57,6 @@ def _stored_path(file_path: str | None) -> Path | None:
         return p if p.exists() and p.is_file() else None
     except Exception:
         return None
-
-def _save_account_ids(conn, image_id: int, ids) -> None:
-    vals=[]
-    for raw in ids or []:
-        norm=normalize_account_id(str(raw or ""))
-        if 6 <= len(norm) <= 24:
-            vals.append((str(raw),norm))
-    for raw,norm in sorted(set(vals), key=lambda x:x[1]):
-        conn.execute(
-            """INSERT INTO image_account_ids(image_id,account_id,normalized_id,created_time)
-               VALUES(?,?,?,?) ON CONFLICT(image_id,normalized_id) DO UPDATE SET
-               account_id=excluded.account_id,created_time=excluded.created_time""",
-            (int(image_id),raw,norm,now_iso()),
-        )
-    conn.execute(
-        """INSERT INTO image_account_id_scan(image_id,scanned_time) VALUES(?,?)
-           ON CONFLICT(image_id) DO UPDATE SET scanned_time=excluded.scanned_time""",
-        (int(image_id),now_iso()),
-    )
-
-
-def _account_id_index_complete(conn) -> bool:
-    total=int(conn.execute("SELECT COUNT(*) FROM images WHERE COALESCE(trusted,1)=1").fetchone()[0] or 0)
-    scanned=int(conn.execute(
-        """SELECT COUNT(*) FROM image_account_id_scan s
-           JOIN images i ON i.id=s.image_id WHERE COALESCE(i.trusted,1)=1"""
-    ).fetchone()[0] or 0)
-    return scanned >= total
-
-
-def _find_account_id_match(conn, query_ids):
-    """Return a trusted image with any matching HeyID, tolerant to OCR glyph errors."""
-    qids=[normalize_account_id(x) for x in (query_ids or []) if normalize_account_id(x)]
-    if not qids:
-        return None
-    # Exact normalized lookup first.
-    ph=','.join('?'*len(qids))
-    row=conn.execute(
-        f"""SELECT i.id,i.customer_id,a.normalized_id FROM image_account_ids a
-            JOIN images i ON i.id=a.image_id
-            WHERE COALESCE(i.trusted,1)=1 AND a.normalized_id IN ({ph})
-            ORDER BY i.id ASC LIMIT 1""", qids,
-    ).fetchone()
-    if row:
-        return row
-    # OCR-tolerant fallback. This scans strings, not images, so it remains cheap.
-    rows=conn.execute(
-        """SELECT i.id,i.customer_id,a.normalized_id FROM image_account_ids a
-           JOIN images i ON i.id=a.image_id WHERE COALESCE(i.trusted,1)=1"""
-    ).fetchall()
-    for r in rows:
-        sid=str(r["normalized_id"] or "")
-        if any(account_id_same_confident(q,sid) for q in qids):
-            return r
-    return None
 
 
 def _save_signatures(conn, image_id: int, signatures):
@@ -382,36 +327,18 @@ def _geometry_score(query_img, candidate_path: Path, qcache=None, conn=None, ima
             qcache["normal"]={"local":local_features(query_img),"gray":prepared_gray(query_img)}
         candidate_local=_load_or_build_candidate_local(conn,int(image_id),cand_img) if conn is not None and image_id is not None else local_features(cand_img)
         normal=_geometry_once(query_img,cand_img,qcache["normal"],candidate_local)
-        best=normal
-        # Only pay for mirror geometry when normal geometry is not already strong.
-        if normal.get("score",0)<90:
-            if "mirror_img" not in qcache:
-                qcache["mirror_img"]=cv2.flip(query_img,1)
-                qcache["mirror"]={"local":local_features(qcache["mirror_img"]),"gray":prepared_gray(qcache["mirror_img"])}
-            mirrored=_geometry_once(qcache["mirror_img"],cand_img,qcache["mirror"],candidate_local)
-            if mirrored.get("score",0)>normal.get("score",0):
-                mirrored["method"]=(mirrored.get("method") or "")+"+MIRROR"
-                best=mirrored
-
-        # V2.0 TEMPLATE-GUARD: profile-page/app templates can share circles,
-        # white canvases, text rows and buttons across unrelated customers.
-        # Compare the customer-specific content inside a reliable avatar circle
-        # and allow that evidence to veto a template-only false match.
-        if "template_profile" not in qcache:
-            qcache["template_profile"]=analyze_template(query_img)
-        tg=compare_template(query_img,cand_img,qcache["template_profile"])
-        best.update(tg)
-        if conn is not None and image_id is not None:
-            try:
-                _save_account_ids(conn,int(image_id),tg.get("candidate_account_ids") or [])
-                conn.commit()
-            except Exception:
-                log.debug("保存候选HeyID索引失败 image=%s",image_id,exc_info=True)
-        return best
+        if normal.get("score",0)>=90:
+            return normal
+        if "mirror_img" not in qcache:
+            qcache["mirror_img"]=cv2.flip(query_img,1)
+            qcache["mirror"]={"local":local_features(qcache["mirror_img"]),"gray":prepared_gray(qcache["mirror_img"])}
+        mirrored=_geometry_once(qcache["mirror_img"],cand_img,qcache["mirror"],candidate_local)
+        if mirrored.get("score",0)>normal.get("score",0):
+            mirrored["method"]=(mirrored.get("method") or "")+"+MIRROR"
+            return mirrored
+        return normal
     except Exception:
-        return {"score":0.0,"inliers":0,"ratio":0.0,"H":None,"method":"","ssim":0.0,"overlap":0.0,"mutual":0,"coverage_q":0.0,"coverage_c":0.0,"homography_sane":False,
-                "template_like":False,"template_veto":False,"template_caution":False,"avatar_content_score":0.0,"circle_reliable_pair":False,
-                "account_id_primary_match":False,"query_account_ids":[],"candidate_account_ids":[]}
+        return {"score":0.0,"inliers":0,"ratio":0.0,"H":None,"method":"","ssim":0.0,"overlap":0.0,"mutual":0,"coverage_q":0.0,"coverage_c":0.0,"homography_sane":False}
 
 def _fetch_light_rows_by_ids(conn, ids):
     ids=list({int(x) for x in ids if x is not None})
@@ -488,8 +415,61 @@ def _ensure_candidate_copy_score(conn, query_views, image_id, candidate_path, ex
         return float(existing_score)
 
 
+
+def _special_id_lookup(conn, external_id):
+    external_id=normalize_external_id(external_id)
+    if not external_id:
+        return None
+    return conn.execute(
+        """SELECT i.id,i.customer_id FROM special_page_ids s
+           JOIN images i ON i.id=s.image_id
+           WHERE s.external_id=? AND COALESCE(i.trusted,1)=1
+           ORDER BY i.id DESC LIMIT 1""",
+        (external_id,),
+    ).fetchone()
+
+
+def _special_id_for_image(conn, image_id):
+    row=conn.execute("SELECT external_id FROM special_page_ids WHERE image_id=?",(int(image_id),)).fetchone()
+    return normalize_external_id(row["external_id"]) if row and row["external_id"] else ""
+
+
+def _cache_special_id(conn, image_id, external_id):
+    external_id=normalize_external_id(external_id)
+    if not external_id:
+        return
+    conn.execute(
+        """INSERT INTO special_page_ids(image_id,external_id,page_type,created_time)
+           VALUES(?,?,?,?)
+           ON CONFLICT(image_id) DO UPDATE SET external_id=excluded.external_id,page_type=excluded.page_type""",
+        (int(image_id),external_id,"heyid_gradient",now_iso()),
+    )
+
+
+def _special_id_for_candidate(conn, image_id, candidate_path):
+    cached=_special_id_for_image(conn,image_id)
+    if cached:
+        return cached
+    if not candidate_path:
+        return ""
+    try:
+        profile=analyze_special_path(candidate_path,run_ocr=True)
+        cid=normalize_external_id(profile.get("external_id") or "") if profile.get("is_special") else ""
+        if cid:
+            _cache_special_id(conn,image_id,cid)
+            conn.commit()
+        return cid
+    except Exception:
+        log.debug("特殊HeyID候选识别失败 image=%s",image_id,exc_info=True)
+        return ""
+
+
 def check_image(path):
-    """V1.9: exact hash -> safe light recall -> SSCD copy-AI recall -> geometry verification."""
+    """V1.9.10: V1.9.9 matcher + narrow HeyID-only special path.
+
+    Ordinary images remain on the original V1.9.9 pipeline. Only the known
+    gradient-circle profile page with a readable HeyID uses ID-primary matching.
+    """
     sha256,md5=hash_file_pair(path)
     conn=get_conn()
     try:
@@ -502,29 +482,26 @@ def check_image(path):
             }
 
         f,img=extract_light_features(path,sha256,md5)
+
+        # Narrow special case only: the known gradient-circle social profile page
+        # with a readable HeyID. Ordinary images do NOT run OCR and continue on
+        # the original V1.9.9 path unchanged.
+        special_profile=analyze_special_page(img,run_ocr=True)
+        special_id=normalize_external_id(special_profile.get("external_id") or "") if special_profile.get("is_special") else ""
+        if special_id:
+            f["special_page_id"]=special_id
+            f["special_page_type"]="heyid_gradient"
+            direct=_special_id_lookup(conn,special_id)
+            if direct:
+                return {
+                    "type":"similar","score":100.0,"matched_image_id":int(direct["id"]),
+                    "features":f,"match_type":"页面ID一致",
+                    "strong_match":True,"learn_safe":False,
+                    "detail":{"special_page":True,"external_id":special_id},
+                }
+
         quality=f.get("quality") or {}
         low_info=bool(quality.get("low_information"))
-
-        # V2.0.3 ID-PRIMARY: on HeyID/profile-template screenshots, the in-page
-        # account ID is the authoritative identity key. One image can contain
-        # multiple cards/IDs; any overlap means collision, different readable IDs
-        # must never be merged merely because the UI/template looks the same.
-        query_profile=analyze_template(img)
-        query_ids=list(query_profile.get("account_ids") or [])
-        f["account_ids"]=query_ids
-        if query_ids:
-            id_row=_find_account_id_match(conn,query_ids)
-            if id_row:
-                return {
-                    "type":"similar","score":100.0,"matched_image_id":int(id_row["id"]),
-                    "features":f,"match_type":"页面ID一致","strong_match":True,"learn_safe":False,
-                    "detail":{"query_account_ids":query_ids,"account_id_primary_match":True},
-                }
-            # Once every existing image has been scanned for HeyID, absence of an
-            # ID match is definitive for this template family. Do not let pHash,
-            # SSCD or repeated UI text manufacture a false collision.
-            if _account_id_index_complete(conn):
-                return {"type":"new","score":0.0,"features":f,"detail":{"query_account_ids":query_ids,"id_primary_new":True}}
 
         candidate_ids=_signature_candidate_ids(conn,f["signatures"]) | _legacy_band_candidate_ids(conn,f)
         all_rows=_full_light_rows(conn)
@@ -543,6 +520,42 @@ def check_image(path):
         # Respect prior human false-positive decisions even on the fast hash path.
         pre_ex_images,pre_ex_customers=_false_positive_exclusions(conn,sha256,f.get("phash"),None)
         light=[x for x in light if int(x["row"]["id"]) not in pre_ex_images and (not x["row"]["customer_id"] or int(x["row"]["customer_id"]) not in pre_ex_customers)]
+
+        # HeyID page fast path. If this one narrow template was detected, the
+        # in-page ID is authoritative and generic template similarity is ignored.
+        # Existing V1.9.9 images may not yet have an ID cache, so lazily inspect
+        # only the strongest light candidates and persist any discovered IDs.
+        # This work happens ONLY for the special page type; ordinary images never
+        # enter this branch.
+        if special_id:
+            legacy_ids=[int(x["row"]["id"]) for x in light[:16]]
+            legacy_deep=_fetch_deep(conn,legacy_ids)
+            ocr_checked=0
+            for item in light[:16]:
+                iid=int(item["row"]["id"])
+                deep=legacy_deep.get(iid)
+                if not deep:
+                    continue
+                cp=_stored_path(deep["file_path"])
+                cid=_special_id_for_candidate(conn,iid,cp) if cp else _special_id_for_image(conn,iid)
+                if not cid:
+                    continue
+                ocr_checked+=1
+                if cid == special_id:
+                    return {
+                        "type":"similar","score":100.0,"matched_image_id":iid,
+                        "features":f,"match_type":"页面ID一致",
+                        "strong_match":True,"learn_safe":False,
+                        "detail":{"special_page":True,"external_id":special_id,"legacy_id_lookup":True},
+                    }
+                # Cap first-run legacy OCR cost. Shared template pages rank very
+                # highly, so six readable special candidates are enough in practice.
+                if ocr_checked>=6:
+                    break
+            return {
+                "type":"new","score":0.0,"features":f,
+                "detail":{"special_page":True,"external_id":special_id,"id_primary":True},
+            }
 
         # V1.9.1 SAFE: perceptual hashes are recall signals only. They never
         # auto-confirm a non-exact collision before SSCD/geometry corroboration.
@@ -590,14 +603,12 @@ def check_image(path):
                 **item,"deep":deep,"orb":orb,"ai":ai,"copy_ai":copy_ai,"hist":hist,
                 "base":base,"geometry":0.0,"inliers":0,"geom_ratio":0.0,"geom_method":"",
                 "ssim":0.0,"overlap":0.0,"mutual":0,"coverage_q":0.0,"coverage_c":0.0,"homography_sane":False,
-                "template_like":False,"template_veto":False,"template_caution":False,"avatar_content_score":0.0,"circle_reliable_pair":False,
-                "account_id_primary_match":False,"query_account_ids":query_ids,"candidate_account_ids":[],
             })
         evaluated.sort(key=lambda x:max(x["base"],x["rank"],x["copy_ai"]),reverse=True)
 
         # Pairwise verification. Candidate local descriptors are cached in SQLite,
         # so repeated checks become cheaper instead of recomputing SIFT/AKAZE.
-        _qgeom_cache={"template_profile":query_profile}
+        _qgeom_cache={}
         for item in evaluated[:GEOMETRY_CANDIDATE_LIMIT]:
             iid=int(item["row"]["id"])
             cp=_stored_path(item["deep"]["file_path"])
@@ -608,12 +619,6 @@ def check_image(path):
                 item["geometry"]=g["score"]; item["inliers"]=g["inliers"]; item["geom_ratio"]=g["ratio"]
                 item["geom_method"]=g.get("method",""); item["ssim"]=g.get("ssim",0.0); item["overlap"]=g.get("overlap",0.0)
                 item["mutual"]=g.get("mutual",0); item["coverage_q"]=g.get("coverage_q",0.0); item["coverage_c"]=g.get("coverage_c",0.0); item["homography_sane"]=bool(g.get("homography_sane",False))
-                item["template_like"]=bool(g.get("template_like",False)); item["template_veto"]=bool(g.get("template_veto",False))
-                item["template_caution"]=bool(g.get("template_caution",False)); item["avatar_content_score"]=float(g.get("avatar_content_score",0.0) or 0.0)
-                item["circle_reliable_pair"]=bool(g.get("circle_reliable_pair",False))
-                item["account_id_primary_match"]=bool(g.get("account_id_primary_match",False))
-                item["query_account_ids"]=list(g.get("query_account_ids") or query_ids)
-                item["candidate_account_ids"]=list(g.get("candidate_account_ids") or [])
 
         best=None
         for item in evaluated:
@@ -707,30 +712,6 @@ def check_image(path):
                 or (not low_info and item["copy_ai"] >= 90 and (item["p"] >= 76 or item["roi"] >= 76 or geom_mid))
             )
 
-            # V2.0.3: same readable HeyID is primary positive evidence for this
-            # template family. It is stronger than placeholder/avatar appearance.
-            if item.get("account_id_primary_match"):
-                strong=True
-                suspect_evidence=True
-                score=100.0
-
-            # V2.0 TEMPLATE-GUARD: if both images are page templates with
-            # reliable prominent avatar circles but the *inside content* of the
-            # circles is clearly different, the shared UI must not produce even
-            # a suspect collision. This directly blocks cases such as the same
-            # HeyID page/gradient-circle layout containing different symbols or
-            # different customer avatars.
-            if item.get("template_veto") and not item.get("account_id_primary_match"):
-                strong=False
-                suspect_evidence=False
-                score=min(score,SIMILAR_THRESHOLD-0.25)
-            elif item.get("template_caution") and item.get("template_like"):
-                # Hough-only/less-certain circle detections never hard-veto. They
-                # simply require a genuinely strong independent copy signal.
-                if not (item["copy_ai"]>=92 and (geom_mid or hash_signal)):
-                    suspect_evidence=False
-                    score=min(score,SIMILAR_THRESHOLD-0.25)
-
             if not strong:
                 score=min(score,AUTO_COLLISION_THRESHOLD-0.25)
             if not suspect_evidence:
@@ -745,16 +726,12 @@ def check_image(path):
                 or (not low_info and item["copy_ai"]>=90 and item["geometry"]>=82 and item["inliers"]>=12)
                 or (strong_hash and item["copy_ai"]>=80)
             )
-            if item.get("template_veto") or item.get("account_id_primary_match"):
-                learn_safe=False
             cur={**item,"score":score,"strong":strong,"learn_safe":learn_safe,"independent":independent,"suspect_evidence":suspect_evidence,"evidence_count":evidence_count}
             if best is None or cur["score"]>best["score"]:
                 best=cur
 
         if best and best["score"]>=SIMILAR_THRESHOLD:
-            if best.get("account_id_primary_match"):
-                mtype="页面ID一致"
-            elif best["copy_ai"]>=82 and best["copy_ai"]>=max(best["geometry"],best["p"]):
+            if best["copy_ai"]>=82 and best["copy_ai"]>=max(best["geometry"],best["p"]):
                 mtype="AI同图识别"
             elif best["geometry"]>=84:
                 mtype="局部同图匹配"
@@ -772,11 +749,6 @@ def check_image(path):
                     "overlap":round(best.get("overlap",0.0),3),"mutual":int(best.get("mutual",0)),
                     "coverage_q":round(float(best.get("coverage_q",0.0)),4),"coverage_c":round(float(best.get("coverage_c",0.0)),4),
                     "homography_sane":bool(best.get("homography_sane",False)),"low_information":low_info,
-                    "template_like":bool(best.get("template_like",False)),"template_veto":bool(best.get("template_veto",False)),
-                    "avatar_content_score":round(float(best.get("avatar_content_score",0.0) or 0.0),2),
-                    "query_account_ids":list(best.get("query_account_ids") or query_ids),
-                    "candidate_account_ids":list(best.get("candidate_account_ids") or []),
-                    "account_id_primary_match":bool(best.get("account_id_primary_match",False)),
                     "blur":round(float(quality.get("lap_var") or 0.0),2),
                 },
             }
@@ -792,13 +764,13 @@ def _insert_image(conn, customer_id, path, file_id, file_unique_id, submitter, s
     q="""INSERT INTO images(file_id,file_unique_id,file_path,sha256,md5,phash,dhash,roi_phash,p0,p1,p2,p3,p4,p5,p6,p7,color_hist,orb_desc,orb_rows,ai_feature,ai_hash,a0,a1,a2,a3,a4,a5,a6,a7,customer_id,submitter,submitter_id,chat_id,source,created_time) VALUES("""+",".join(["?"]*35)+")"
     cur=conn.execute(q,vals); image_id=cur.lastrowid
     _save_signatures(conn,image_id,f.get("signatures"))
-    try:
-        ids=list(f.get("account_ids") or [])
-        if not ids:
-            ids=extract_template_account_ids(read_image(path))
-        _save_account_ids(conn,image_id,ids)
-    except Exception:
-        log.debug("保存新图片HeyID索引失败 image=%s",image_id,exc_info=True)
+    # Special HeyID cache is written only when the narrow template path was
+    # actually detected during checking. Ordinary images never invoke OCR here.
+    if f.get("special_page_id"):
+        try:
+            _cache_special_id(conn,image_id,f.get("special_page_id"))
+        except Exception:
+            log.debug("保存特殊页面HeyID失败 image=%s",image_id,exc_info=True)
     # New formal customers are indexed immediately. Normally check_image already
     # produced copy_views; this fallback covers alternate entry paths so a newly
     # saved customer is searchable by SSCD before the insert transaction finishes.
@@ -1004,49 +976,6 @@ def count_copy_index_status():
         total=int(conn.execute("SELECT COUNT(*) FROM images").fetchone()[0] or 0)
         indexed=int(conn.execute("SELECT COUNT(DISTINCT image_id) FROM image_copy_features").fetchone()[0] or 0)
         return total,indexed,max(0,total-indexed)
-    finally:
-        conn.close()
-
-
-def reindex_missing_account_ids(limit=10):
-    """OCR old stored images for HeyID(s). Marks scans even when no ID exists."""
-    conn=get_conn()
-    rows=conn.execute(
-        """SELECT i.id,i.file_path FROM images i
-           LEFT JOIN image_account_id_scan s ON s.image_id=i.id
-           WHERE s.image_id IS NULL AND COALESCE(i.trusted,1)=1
-           ORDER BY i.id ASC LIMIT ?""", (max(int(limit)*10,100),)
-    ).fetchall()
-    done=0
-    try:
-        for row in rows:
-            if done>=int(limit): break
-            p=_stored_path(row["file_path"])
-            if not p:
-                _save_account_ids(conn,int(row["id"]),[]); done+=1; continue
-            try:
-                im=read_image(p)
-                ids=extract_template_account_ids(im)
-                _save_account_ids(conn,int(row["id"]),ids)
-                done+=1
-            except Exception:
-                log.debug("HeyID reindex failed image=%s",row["id"],exc_info=True)
-                _save_account_ids(conn,int(row["id"]),[]); done+=1
-        conn.commit(); return done
-    finally:
-        conn.close()
-
-
-def count_account_id_index_status():
-    conn=get_conn()
-    try:
-        total=int(conn.execute("SELECT COUNT(*) FROM images WHERE COALESCE(trusted,1)=1").fetchone()[0] or 0)
-        scanned=int(conn.execute(
-            """SELECT COUNT(*) FROM image_account_id_scan s JOIN images i ON i.id=s.image_id
-               WHERE COALESCE(i.trusted,1)=1"""
-        ).fetchone()[0] or 0)
-        ids=int(conn.execute("SELECT COUNT(DISTINCT image_id) FROM image_account_ids").fetchone()[0] or 0)
-        return total,scanned,max(0,total-scanned),ids
     finally:
         conn.close()
 

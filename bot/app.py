@@ -11,7 +11,7 @@ from bot.recover import recover_images_command
 from ai.embedding import preload
 from ai.copy_embedding import preload as preload_copy_ai
 from core.database import cleanup_expired_pending_buffers
-from core.image_match import reindex_missing_signatures, reindex_missing_copy_features, count_copy_index_status, count_signature_index_status, reindex_missing_account_ids, count_account_id_index_status, cleanup_orphan_image_files
+from core.image_match import reindex_missing_signatures, reindex_missing_copy_features, count_copy_index_status, count_signature_index_status, cleanup_orphan_image_files
 
 log = logging.getLogger(__name__)
 
@@ -80,27 +80,6 @@ async def _periodic_copy_reindex(context) -> None:
             log.info("V1.9 SSCD AI旧图库索引100%%完成，后台任务已停止；新客户入库时即时生成SSCD特征")
     except Exception:
         log.warning("V1.9 SSCD AI索引升级失败（经典视觉仍可用）",exc_info=True)
-
-
-async def _periodic_account_id_reindex(context) -> None:
-    """Backfill HeyID/page-ID OCR index; stop automatically at 100%."""
-    try:
-        loop=asyncio.get_running_loop()
-        total,scanned,missing,with_ids=await loop.run_in_executor(None,count_account_id_index_status)
-        if missing <= 0:
-            if getattr(context,"job",None):
-                context.job.schedule_removal()
-            log.info("页面ID索引已完成 %d/%d（含ID图片 %d），后台任务停止",scanned,total,with_ids)
-            return
-        done=await loop.run_in_executor(None,reindex_missing_account_ids,8)
-        total,scanned,missing,with_ids=await loop.run_in_executor(None,count_account_id_index_status)
-        if done:
-            log.info("页面ID索引升级：本轮 %d 张；已扫描 %d/%d，剩余 %d，含ID图片 %d",done,scanned,total,missing,with_ids)
-        if missing <= 0 and getattr(context,"job",None):
-            context.job.schedule_removal()
-            log.info("页面ID旧图库索引100%%完成，后台任务已停止；新图片即时提取ID")
-    except Exception:
-        log.warning("页面ID索引后台升级失败（不影响实时检测）",exc_info=True)
 
 
 async def _periodic_cleanup_orphan_images(context) -> None:
@@ -183,18 +162,6 @@ async def _post_init(app):
         log.warning("注册 V1.9 SSCD AI索引升级任务失败（不影响实时检测）",exc_info=True)
 
     try:
-        total,scanned,missing,with_ids=await loop.run_in_executor(None,count_account_id_index_status)
-        if missing > 0:
-            app.job_queue.run_repeating(
-                _periodic_account_id_reindex, interval=20, first=15, name="v203_reindex_page_ids",
-            )
-            log.info("页面ID待扫描 %d 张：已启动后台任务，每20秒最多8张；补完自动停止",missing)
-        else:
-            log.info("页面ID索引已完成 %d/%d（含ID图片 %d）：不启动后台任务",scanned,total,with_ids)
-    except Exception:
-        log.warning("注册 页面ID索引升级任务失败（不影响实时检测）",exc_info=True)
-
-    try:
         app.job_queue.run_repeating(
             _periodic_cleanup_orphan_images,
             interval=6*3600,
@@ -242,7 +209,7 @@ def start():
     app.add_handler(CallbackQueryHandler(collision_callback, pattern=r"^collision:"))
 
     app.add_error_handler(_error)
-    print("TG防撞客机器人 V2.0.3 ID-PRIMARY MULTI-ID PLACEHOLDER-GUARD TEMPLATE-ID-GUARD CLEAN-ENTRY-REPLY PRECHECKED-NEW DIRECT-ENTRY AUTO-FIND-IMAGE EDITED-CAPTION-ENTRY REVIEW-FIX MATCH-PREVIEW SAFE-MATCH SSCD-AI COPY-GUARD AUTO90 GitHub + Railway 启动（群聊专用 / 私聊关闭）")
+    print("TG防撞客机器人 V1.9.10 SPECIAL-HEYID（基于V1.9.9）CLEAN-ENTRY-REPLY SSCD-AI COPY-GUARD AUTO90 GitHub + Railway 启动（群聊专用 / 私聊关闭）")
     app.run_polling(
         drop_pending_updates=False,
         allowed_updates=["message", "edited_message", "callback_query"],

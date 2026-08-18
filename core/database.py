@@ -230,23 +230,6 @@ def init_db() -> None:
         """)
 
         conn.execute("""
-        CREATE TABLE IF NOT EXISTS image_account_ids(
-            image_id INTEGER NOT NULL,
-            account_id TEXT NOT NULL,
-            normalized_id TEXT NOT NULL,
-            created_time TEXT,
-            PRIMARY KEY(image_id, normalized_id)
-        )
-        """)
-
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS image_account_id_scan(
-            image_id INTEGER PRIMARY KEY,
-            scanned_time TEXT
-        )
-        """)
-
-        conn.execute("""
         CREATE TABLE IF NOT EXISTS false_positive_pairs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             query_sha256 TEXT NOT NULL,
@@ -354,6 +337,15 @@ def init_db() -> None:
         )
         """)
 
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS special_page_ids(
+            image_id INTEGER PRIMARY KEY,
+            external_id TEXT NOT NULL,
+            page_type TEXT DEFAULT 'heyid_gradient',
+            created_time TEXT
+        )
+        """)
+
         # V1.9.3: 图片缓冲允许同一员工连续发送多张图片。旧版按 user_id 唯一会覆盖前一张，
         # 导致稍后回复较早图片时重启后无法配对。迁移为 message_id 唯一。
         conn.execute("DROP INDEX IF EXISTS idx_pending_buffer_key")
@@ -373,6 +365,8 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_crash_logs_created ON crash_logs(created_time)",
             "CREATE INDEX IF NOT EXISTS idx_message_image_links_owner ON message_image_links(chat_id,owner_user_id,created_time)",
             "CREATE INDEX IF NOT EXISTS idx_message_image_links_source ON message_image_links(chat_id,source_image_message_id)",
+            "CREATE INDEX IF NOT EXISTS idx_special_page_external_id ON special_page_ids(external_id)",
+            "CREATE INDEX IF NOT EXISTS idx_special_page_image ON special_page_ids(image_id)",
             "CREATE INDEX IF NOT EXISTS idx_sig_image ON image_signatures(image_id)",
             "CREATE INDEX IF NOT EXISTS idx_false_query ON false_positive_pairs(query_sha256)",
             "CREATE INDEX IF NOT EXISTS idx_false_match ON false_positive_pairs(matched_image_id)",
@@ -381,8 +375,6 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_copy_features_simhash ON image_copy_features(simhash)",
             "CREATE INDEX IF NOT EXISTS idx_copy_lsh_band_value ON image_copy_lsh(band,value)",
             "CREATE INDEX IF NOT EXISTS idx_false_customer ON false_positive_pairs(matched_customer_id)",
-            "CREATE INDEX IF NOT EXISTS idx_image_account_norm ON image_account_ids(normalized_id)",
-            "CREATE INDEX IF NOT EXISTS idx_image_account_image ON image_account_ids(image_id)",
         ]
         for i in range(8):
             index_sql.append(f"CREATE INDEX IF NOT EXISTS idx_sig_b{i} ON image_signatures(b{i})")
