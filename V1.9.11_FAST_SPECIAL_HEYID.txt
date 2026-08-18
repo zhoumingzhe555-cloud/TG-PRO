@@ -1,0 +1,20 @@
+V1.9.11 FAST-SPECIAL-HEYID
+
+基线：V1.9.9 CLEAN-ENTRY-REPLY。
+
+普通图片：
+- 完整保持 V1.9.9 的 SSCD / Hash / SIFT / AKAZE / ORB / RANSAC 流程。
+- 不运行 HeyID OCR。
+
+仅特殊 HeyID 页面：
+- 快速识别粉紫/粉红/橙红渐变圆形徽章 + 平坦白底或黑底页面。
+- 只截圆形下方 HeyID 小区域，正常只跑 1 次 OCR；失败才补 1 次。
+- HeyID 相同：100% 撞客（页面ID一致）。
+- HeyID 不同：直接新客户，不允许公共模板导致误撞。
+- HeyID 读不到：回退 V1.9.9 原图识别，不乱猜。
+
+针对真实参考图已覆盖：
+- 黑底页面：HeyID WCT26554703
+- 白底页面：HeyID KRY21449946
+
+没有 V2.0.3 的全图库页面ID后台OCR任务，不会每20秒扫描全部图片。

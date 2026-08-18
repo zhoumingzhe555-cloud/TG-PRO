@@ -209,7 +209,7 @@ def start():
     app.add_handler(CallbackQueryHandler(collision_callback, pattern=r"^collision:"))
 
     app.add_error_handler(_error)
-    print("TG防撞客机器人 V1.9.10 SPECIAL-HEYID（基于V1.9.9）CLEAN-ENTRY-REPLY SSCD-AI COPY-GUARD AUTO90 GitHub + Railway 启动（群聊专用 / 私聊关闭）")
+    print("TG防撞客机器人 V1.9.11 FAST-SPECIAL-HEYID（基于V1.9.9）CLEAN-ENTRY-REPLY SSCD-AI COPY-GUARD AUTO90 GitHub + Railway 启动（群聊专用 / 私聊关闭）")
     app.run_polling(
         drop_pending_updates=False,
         allowed_updates=["message", "edited_message", "callback_query"],
